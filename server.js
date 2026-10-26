@@ -274,6 +274,29 @@ app.post('/api/admin/menu', authenticateToken, verifyAdminOrStaff, async (req, r
     }
 });
 
+app.put('/api/admin/menu/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    const { name, category, price, image_url } = req.body;
+    try {
+        if (image_url) {
+            // Update everything including the new image
+            await pool.execute(
+                'UPDATE menu_items SET name = ?, category = ?, price = ?, image_url = ? WHERE id = ?',
+                [name, category, price, image_url, req.params.id]
+            );
+        } else {
+            // Keep the old image, update just the text
+            await pool.execute(
+                'UPDATE menu_items SET name = ?, category = ?, price = ? WHERE id = ?',
+                [name, category, price, req.params.id]
+            );
+        }
+        res.json({ message: 'Item updated successfully' });
+    } catch (error) {
+        console.error("Menu Update Error:", error);
+        res.status(500).json({ error: 'Failed to update item' });
+    }
+});
+
 app.put('/api/admin/menu/:id/stock', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     const { is_sold_out } = req.body;
     try {
