@@ -11,13 +11,36 @@ const { Server } = require('socket.io');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+
+// Enable CORS for localhost and your Vercel domains
+const allowedOrigins = [
+    'http://localhost:5173',
+    'https://3kitchen.vercel.app',
+    'https://3kfrontend.vercel.app',
+    process.env.FRONTEND_URL
+];
+
+app.use(cors({
+    origin: function(origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true
+}));
+
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST", "PUT", "DELETE"] }
+    cors: { 
+        origin: allowedOrigins,
+        methods: ["GET", "POST", "PUT", "DELETE"],
+        credentials: true
+    }
 });
 
 const uploadDir = path.join(__dirname, 'uploads');
@@ -37,13 +60,11 @@ io.on('connection', (socket) => {
     });
     
     socket.on('send_message', async (data) => {
-        // data format: { orderId, sender, text, time }
         try {
             await pool.execute(
                 'INSERT INTO order_chats (order_id, sender, message) VALUES (?, ?, ?)',
                 [data.orderId, data.sender, data.text]
             );
-            // Broadcast the message to anyone in the order room (Rider & Cashier)
             io.to(`order_${data.orderId}`).emit('receive_message', data);
         } catch (error) {
             console.error('Socket DB Insert Error:', error);
@@ -72,6 +93,11 @@ const verifyAdminOrStaff = (req, res, next) => {
     if (req.user && (req.user.role === 'admin' || req.user.role === 'cashier' || req.user.role === 'rider')) next();
     else res.status(403).json({ error: 'Staff access required' });
 };
+
+// Root Health Check to fix "Cannot GET /"
+app.get('/', (req, res) => {
+    res.send('3K Kitchen API is running successfully!');
+});
 
 app.get('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
@@ -156,8 +182,6 @@ app.post('/api/guest', async (req, res) => {
         res.status(500).json({ error: 'Guest login failed.' });
     }
 });
-
-// Middleware array to handle both JSON and Multipart FormData
 
 app.post('/api/orders', authenticateToken, async (req, res) => {
     const { items, totalAmount, orderType, branch, address, phone, paymentMethod, notes, receipt_url } = req.body;
@@ -309,7 +333,6 @@ app.get('/api/admin/riders', authenticateToken, verifyAdminOrStaff, async (req, 
 
 app.get('/api/orders/:id/chat', authenticateToken, async (req, res) => {
     try {
-        // Create table if it doesn't exist (useful for first-time deployment)
         await pool.execute(`
             CREATE TABLE IF NOT EXISTS order_chats (
                 id INT AUTO_INCREMENT PRIMARY KEY,
