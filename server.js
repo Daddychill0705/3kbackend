@@ -156,7 +156,20 @@ app.post('/api/login', async (req, res) => {
         if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
-        res.json({ token, user: { id: user.id, name: `${user.firstname} ${user.lastname}`, email: user.email, role: user.role } });
+        
+        // Return extra fields so the frontend has them in context
+        res.json({ 
+            token, 
+            user: { 
+                id: user.id, 
+                name: `${user.firstname} ${user.lastname}`, 
+                email: user.email, 
+                role: user.role,
+                phone: user.phone || '',
+                dob: user.dob || '',
+                last_updated: user.last_updated || null
+            } 
+        });
     } catch (error) {
         res.status(500).json({ error: 'Login failed.' });
     }
@@ -177,9 +190,52 @@ app.post('/api/guest', async (req, res) => {
             user = rows[0];
         }
         const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
-        res.json({ token, user: { id: user.id, name: `${user.firstname} ${user.lastname}`, email: user.email, role: user.role } });
+        res.json({ token, user: { id: user.id, name: `${user.firstname} ${user.lastname}`, email: user.email, role: user.role, phone: '', dob: '', last_updated: null } });
     } catch (error) {
         res.status(500).json({ error: 'Guest login failed.' });
+    }
+});
+
+// --- NEW ROUTE: UPDATE PROFILE WITH COOLDOWN ---
+app.put('/api/users/profile', authenticateToken, async (req, res) => {
+    const { email, phone, dob } = req.body;
+    const userId = req.user.id;
+
+    try {
+        // First ensure these columns exist (for seamless deployment)
+        try {
+            await pool.execute('ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL');
+            await pool.execute('ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL');
+            await pool.execute('ALTER TABLE users ADD COLUMN last_updated DATETIME DEFAULT NULL');
+        } catch (e) {
+            // Ignore if columns already exist
+        }
+
+        // Check the current cooldown
+        const [rows] = await pool.execute('SELECT last_updated FROM users WHERE id = ?', [userId]);
+        const lastUpdated = rows[0].last_updated;
+
+        if (lastUpdated) {
+            const thirtyDaysInMs = 30 * 24 * 60 * 60 * 1000;
+            const now = new Date();
+            const lastUpdateDate = new Date(lastUpdated);
+            
+            if (now - lastUpdateDate < thirtyDaysInMs) {
+                const daysLeft = Math.ceil((thirtyDaysInMs - (now - lastUpdateDate)) / (1000 * 60 * 60 * 24));
+                return res.status(403).json({ error: `You must wait ${daysLeft} more days before updating your profile again.` });
+            }
+        }
+
+        // Perform the update
+        await pool.execute(
+            'UPDATE users SET email = ?, phone = ?, dob = ?, last_updated = NOW() WHERE id = ?',
+            [email, phone, dob || null, userId]
+        );
+
+        res.json({ message: 'Profile updated successfully' });
+    } catch (error) {
+        console.error("Profile Update Error:", error);
+        res.status(500).json({ error: 'Failed to update profile' });
     }
 });
 
