@@ -32,15 +32,21 @@ const upload = multer({ storage });
 
 const pool = mysql.createPool(process.env.TIDB_URI);
 
-// Ensure necessary columns exist dynamically
+// FIX: Process each column update individually so one existing column doesn't block the rest
 const initializeDB = async () => {
-    try {
-        await pool.execute('ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL');
-        await pool.execute('ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL');
-        await pool.execute('ALTER TABLE users ADD COLUMN last_updated DATETIME DEFAULT NULL');
-        await pool.execute('ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL');
-    } catch (e) {
-        // Columns likely exist, ignore
+    const columnsToAdd = [
+        'ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
+        'ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL',
+        'ALTER TABLE users ADD COLUMN last_updated DATETIME DEFAULT NULL',
+        'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL'
+    ];
+
+    for (let query of columnsToAdd) {
+        try {
+            await pool.execute(query);
+        } catch (e) {
+            // Ignore error if this specific column already exists
+        }
     }
 };
 initializeDB();
@@ -93,7 +99,10 @@ app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, 
             [firstname, lastname, email, hashedPassword, role, branch || null]
         );
         res.status(201).json({ message: 'User created successfully' });
-    } catch (error) { res.status(500).json({ error: 'Failed to create user. Email may already exist.' }); }
+    } catch (error) { 
+        console.error("Admin User Create Error:", error);
+        res.status(500).json({ error: 'Failed to create user. Email may already exist.' }); 
+    }
 });
 
 app.delete('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
