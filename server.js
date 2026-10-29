@@ -261,6 +261,31 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     }
 });
 
+app.get('/api/orders', authenticateToken, async (req, res) => {
+    try {
+        // Fetch only the orders belonging to the logged-in user
+        const [orders] = await pool.execute(
+            'SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC',
+            [req.user.id]
+        );
+        
+        // Fetch the items for each order so the UI can map through them
+        for (let order of orders) {
+            const [items] = await pool.execute(
+                "SELECT item_name as name, quantity as qty, price FROM order_items WHERE order_id = ?", 
+                [order.id]
+            );
+            order.items = items;
+            order.date = new Date(order.created_at).toLocaleString();
+        }
+        
+        res.json(orders);
+    } catch (error) {
+        console.error("User Orders Fetch Error:", error);
+        res.status(500).json({ error: 'Failed to fetch user orders' });
+    }
+});
+
 app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         const [orders] = await pool.execute(`
