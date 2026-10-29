@@ -12,22 +12,9 @@ require('dotenv').config();
 
 const app = express();
 
-// Enable CORS for localhost and your Vercel domains
-const allowedOrigins = [
-    'http://localhost:5173',
-    'https://3kitchen.vercel.app',
-    'https://3kfrontend.vercel.app',
-    process.env.FRONTEND_URL
-];
-
+// Temporarily open CORS to all origins to prevent 403 errors during testing
 app.use(cors({
-    origin: function(origin, callback) {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
+    origin: '*', 
     credentials: true
 }));
 
@@ -37,7 +24,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { 
-        origin: allowedOrigins,
+        origin: '*', // Open socket origins as well
         methods: ["GET", "POST", "PUT", "DELETE"],
         credentials: true
     }
@@ -108,6 +95,7 @@ app.get('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, r
     }
 });
 
+// --- FIX: Explicitly handle the new columns in the INSERT query ---
 app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     const { firstname, lastname, email, password, role } = req.body;
     try {
@@ -132,6 +120,7 @@ app.delete('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async 
     }
 });
 
+// --- FIX: Explicitly handle the new columns in the INSERT query ---
 app.post('/api/register', async (req, res) => {
     const { firstname, lastname, email, password, role } = req.body;
     try {
@@ -159,7 +148,6 @@ app.post('/api/login', async (req, res) => {
 
         const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
         
-        // Return extra fields so the frontend has them in context
         res.json({ 
             token, 
             user: { 
@@ -184,7 +172,7 @@ app.post('/api/guest', async (req, res) => {
         if (rows.length === 0) {
             const hashedPassword = await bcrypt.hash('guest123', 10);
             const [result] = await pool.execute(
-                'INSERT INTO users (firstname, lastname, email, password, role) VALUES (?, ?, ?, ?, ?)',
+                'INSERT INTO users (firstname, lastname, email, password, role, phone, dob) VALUES (?, ?, ?, ?, ?, NULL, NULL)',
                 ['Guest', 'User', 'guest@3kkitchen.local', hashedPassword, 'customer']
             );
             user = { id: result.insertId, role: 'customer', firstname: 'Guest', lastname: 'User', email: 'guest@3kkitchen.local' };
@@ -198,13 +186,11 @@ app.post('/api/guest', async (req, res) => {
     }
 });
 
-// --- NEW ROUTE: UPDATE PROFILE WITH COOLDOWN ---
 app.put('/api/users/profile', authenticateToken, async (req, res) => {
     const { email, phone, dob } = req.body;
     const userId = req.user.id;
 
     try {
-        // First ensure these columns exist (for seamless deployment)
         try {
             await pool.execute('ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL');
             await pool.execute('ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL');
@@ -213,7 +199,6 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
             // Ignore if columns already exist
         }
 
-        // Check the current cooldown
         const [rows] = await pool.execute('SELECT last_updated FROM users WHERE id = ?', [userId]);
         const lastUpdated = rows[0].last_updated;
 
@@ -228,7 +213,6 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
             }
         }
 
-        // Perform the update
         await pool.execute(
             'UPDATE users SET email = ?, phone = ?, dob = ?, last_updated = NOW() WHERE id = ?',
             [email, phone, dob || null, userId]
