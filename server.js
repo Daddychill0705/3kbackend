@@ -32,7 +32,6 @@ const upload = multer({ storage });
 
 const pool = mysql.createPool(process.env.TIDB_URI);
 
-// FIX: Process each column update individually so one existing column doesn't block the rest
 const initializeDB = async () => {
     const columnsToAdd = [
         'ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
@@ -102,6 +101,29 @@ app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, 
     } catch (error) { 
         console.error("Admin User Create Error:", error);
         res.status(500).json({ error: 'Failed to create user. Email may already exist.' }); 
+    }
+});
+
+// NEW FIX: Update Users Endpoint for Editing Staff & Riders
+app.put('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    const { firstname, lastname, email, password, role, branch } = req.body;
+    try {
+        if (password && password.trim() !== '') {
+            const hashedPassword = await bcrypt.hash(password, 10);
+            await pool.execute(
+                'UPDATE users SET firstname=?, lastname=?, email=?, password=?, role=?, branch=? WHERE id=?',
+                [firstname, lastname, email, hashedPassword, role, branch || null, req.params.id]
+            );
+        } else {
+            await pool.execute(
+                'UPDATE users SET firstname=?, lastname=?, email=?, role=?, branch=? WHERE id=?',
+                [firstname, lastname, email, role, branch || null, req.params.id]
+            );
+        }
+        res.json({ message: 'User updated successfully' });
+    } catch (error) { 
+        console.error("User Update Error:", error);
+        res.status(500).json({ error: 'Failed to update user.' }); 
     }
 });
 
