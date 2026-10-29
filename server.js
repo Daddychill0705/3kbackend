@@ -113,11 +113,12 @@ app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, 
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         await pool.execute(
-            'INSERT INTO users (firstname, lastname, email, password, role) VALUES (?, ?, ?, ?, ?)',
+            'INSERT INTO users (firstname, lastname, email, password, role, phone, dob) VALUES (?, ?, ?, ?, ?, NULL, NULL)',
             [firstname, lastname, email, hashedPassword, role]
         );
         res.status(201).json({ message: 'User created successfully' });
     } catch (error) {
+        console.error("Admin User Create Error:", error);
         res.status(500).json({ error: 'Failed to create user. Email may already exist.' });
     }
 });
@@ -136,11 +137,12 @@ app.post('/api/register', async (req, res) => {
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         await pool.execute(
-            'INSERT INTO users (firstname, lastname, email, password, role) VALUES (?, ?, ?, ?, ?)',
+            'INSERT INTO users (firstname, lastname, email, password, role, phone, dob) VALUES (?, ?, ?, ?, ?, NULL, NULL)',
             [firstname, lastname, email, hashedPassword, role || 'customer']
         );
         res.status(201).json({ message: 'User created successfully' });
     } catch (error) {
+        console.error("Registration Error:", error);
         res.status(500).json({ error: 'Registration failed or email exists.' });
     }
 });
