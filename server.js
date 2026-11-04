@@ -47,8 +47,29 @@ const initializeDB = async () => {
             // Ignore error if this specific column already exists
         }
     }
+
+    try {
+        await pool.execute(`CREATE TABLE IF NOT EXISTS activity_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_name VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL,
+            action VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+    } catch (e) { console.error('Failed to create activity_logs table', e); }
 };
 initializeDB();
+
+// Helper to log activities
+const logActivity = async (userId, action) => {
+    try {
+        const [rows] = await pool.execute('SELECT firstname, lastname, role FROM users WHERE id = ?', [userId]);
+        if (rows.length > 0) {
+            const name = `${rows[0].firstname} ${rows[0].lastname}`;
+            await pool.execute('INSERT INTO activity_logs (user_name, role, action) VALUES (?, ?, ?)', [name, rows[0].role, action]);
+        }
+    } catch(err) { console.error('Activity Log Error:', err); }
+};
 
 io.on('connection', (socket) => {
     socket.on('join_order', (orderId) => { socket.join(`order_${orderId}`); });
@@ -82,6 +103,13 @@ const verifyAdminOrStaff = (req, res, next) => {
 
 app.get('/', (req, res) => res.send('3K Kitchen API is running successfully!'));
 
+app.get('/api/admin/activity-logs', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    try {
+        const [logs] = await pool.execute('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 100');
+        res.json(logs);
+    } catch (error) { res.status(500).json({ error: 'Failed to fetch logs' }); }
+});
+
 app.get('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         const [users] = await pool.execute('SELECT id, firstname, lastname, email, role, branch, created_at FROM users WHERE role IN ("admin", "cashier") ORDER BY role, firstname');
@@ -97,14 +125,13 @@ app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, 
             'INSERT INTO users (firstname, lastname, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)',
             [firstname, lastname, email, hashedPassword, role, branch || null]
         );
+        await logActivity(req.user.id, `Created new ${role} account: ${email}`);
         res.status(201).json({ message: 'User created successfully' });
     } catch (error) { 
-        console.error("Admin User Create Error:", error);
         res.status(500).json({ error: 'Failed to create user. Email may already exist.' }); 
     }
 });
 
-// NEW FIX: Update Users Endpoint for Editing Staff & Riders
 app.put('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     const { firstname, lastname, email, password, role, branch } = req.body;
     try {
@@ -120,16 +147,15 @@ app.put('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (re
                 [firstname, lastname, email, role, branch || null, req.params.id]
             );
         }
+        await logActivity(req.user.id, `Updated account details for ID: ${req.params.id}`);
         res.json({ message: 'User updated successfully' });
-    } catch (error) { 
-        console.error("User Update Error:", error);
-        res.status(500).json({ error: 'Failed to update user.' }); 
-    }
+    } catch (error) { res.status(500).json({ error: 'Failed to update user.' }); }
 });
 
 app.delete('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('DELETE FROM users WHERE id = ?', [req.params.id]);
+        await logActivity(req.user.id, `Deleted account ID: ${req.params.id}`);
         res.json({ message: 'User deleted' });
     } catch (error) { res.status(500).json({ error: 'Failed to delete user' }); }
 });
@@ -157,6 +183,12 @@ app.post('/api/login', async (req, res) => {
         if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
+        
+        // Log staff logins
+        if (user.role !== 'customer') {
+            await logActivity(user.id, 'Logged into the system');
+        }
+
         res.json({ 
             token, 
             user: { 
@@ -222,6 +254,9 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
             await connection.execute('INSERT INTO order_items (order_id, item_name, quantity, price) VALUES (?, ?, ?, ?)', [orderResult.insertId, item.name, item.qty, parseFloat(item.price)]);
         }
         await connection.commit();
+        
+        await logActivity(req.user.id, `Placed new order O-${String(orderResult.insertId).padStart(4, '0')}`);
+        
         io.emit('dashboard_refresh'); 
         res.status(201).json({ message: 'Order placed', orderId: orderResult.insertId });
     } catch (error) {
@@ -259,6 +294,8 @@ app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, 
 app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('UPDATE orders SET status = ? WHERE id = ?', [req.body.status, req.params.id]);
+        await logActivity(req.user.id, `Updated order O-${String(req.params.id).padStart(4, '0')} status to ${req.body.status}`);
+        
         io.emit('dashboard_refresh'); 
         res.json({ message: 'Status updated' });
     } catch (error) { res.status(500).json({ error: 'Failed to update status' }); }
@@ -274,6 +311,7 @@ app.get('/api/menu', async (req, res) => {
 app.post('/api/admin/menu', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('INSERT INTO menu_items (name, category, price, image_url) VALUES (?, ?, ?, ?)', [req.body.name, req.body.category, req.body.price, req.body.image_url || '/img/default-food.jpg']);
+        await logActivity(req.user.id, `Added new menu item: ${req.body.name}`);
         res.status(201).json({ message: 'Item added' });
     } catch (error) { res.status(500).json({ error: 'Failed to add item' }); }
 });
@@ -285,6 +323,7 @@ app.put('/api/admin/menu/:id', authenticateToken, verifyAdminOrStaff, async (req
         } else {
             await pool.execute('UPDATE menu_items SET name = ?, category = ?, price = ? WHERE id = ?', [req.body.name, req.body.category, req.body.price, req.params.id]);
         }
+        await logActivity(req.user.id, `Updated menu item: ${req.body.name}`);
         res.json({ message: 'Item updated' });
     } catch (error) { res.status(500).json({ error: 'Failed to update item' }); }
 });
@@ -292,6 +331,7 @@ app.put('/api/admin/menu/:id', authenticateToken, verifyAdminOrStaff, async (req
 app.put('/api/admin/menu/:id/stock', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('UPDATE menu_items SET is_sold_out = ? WHERE id = ?', [req.body.is_sold_out, req.params.id]);
+        await logActivity(req.user.id, `Updated stock status for item ID: ${req.params.id}`);
         res.json({ message: 'Stock updated' });
     } catch (error) { res.status(500).json({ error: 'Failed to update stock' }); }
 });
@@ -299,6 +339,7 @@ app.put('/api/admin/menu/:id/stock', authenticateToken, verifyAdminOrStaff, asyn
 app.delete('/api/admin/menu/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('DELETE FROM menu_items WHERE id = ?', [req.params.id]);
+        await logActivity(req.user.id, `Deleted menu item ID: ${req.params.id}`);
         res.json({ message: 'Item deleted' });
     } catch (error) { res.status(500).json({ error: 'Failed to delete item' }); }
 });
@@ -313,6 +354,7 @@ app.get('/api/branches', async (req, res) => {
 app.post('/api/admin/branches', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('INSERT INTO branches (name, code, address, phone) VALUES (?, ?, ?, ?)', [req.body.name, req.body.code, req.body.address, req.body.phone]);
+        await logActivity(req.user.id, `Created new branch: ${req.body.name}`);
         res.status(201).json({ message: 'Branch added' });
     } catch (error) { res.status(500).json({ error: 'Failed to add branch' }); }
 });
@@ -320,6 +362,7 @@ app.post('/api/admin/branches', authenticateToken, verifyAdminOrStaff, async (re
 app.put('/api/admin/branches/:id/status', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('UPDATE branches SET is_active = ? WHERE id = ?', [req.body.is_active, req.params.id]);
+        await logActivity(req.user.id, `Updated branch status for ID: ${req.params.id}`);
         res.json({ message: 'Branch status updated' });
     } catch (error) { res.status(500).json({ error: 'Failed to update branch' }); }
 });
