@@ -105,7 +105,7 @@ app.get('/', (req, res) => res.send('3K Kitchen API is running successfully!'));
 
 app.get('/api/admin/activity-logs', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
-        const [logs] = await pool.execute('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 100');
+        const [logs] = await pool.execute('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 500');
         res.json(logs);
     } catch (error) { res.status(500).json({ error: 'Failed to fetch logs' }); }
 });
@@ -115,6 +115,14 @@ app.get('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, r
         const [users] = await pool.execute('SELECT id, firstname, lastname, email, role, branch, created_at FROM users WHERE role IN ("admin", "cashier") ORDER BY role, firstname');
         res.json(users);
     } catch (error) { res.status(500).json({ error: 'Failed to fetch users' }); }
+});
+
+// NEW ENDPOINT: Fetch Customers for the Admin Panel
+app.get('/api/admin/customers', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    try {
+        const [customers] = await pool.execute('SELECT id, firstname, lastname, email, phone, dob, created_at FROM users WHERE role = "customer" ORDER BY created_at DESC');
+        res.json(customers);
+    } catch (error) { res.status(500).json({ error: 'Failed to fetch customers' }); }
 });
 
 app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, res) => {
