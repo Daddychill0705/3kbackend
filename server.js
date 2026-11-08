@@ -301,6 +301,16 @@ app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, a
     } catch (error) { res.status(500).json({ error: 'Failed to update status' }); }
 });
 
+app.put('/api/admin/orders/:id/payment', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    try {
+        await pool.execute('UPDATE orders SET payment_method = ? WHERE id = ?', [req.body.paymentMethod, req.params.id]);
+        await logActivity(req.user.id, `Processed payment for order O-${String(req.params.id).padStart(4, '0')}`);
+        
+        io.emit('dashboard_refresh'); 
+        res.json({ message: 'Payment method updated' });
+    } catch (error) { res.status(500).json({ error: 'Failed to update payment method' }); }
+});
+
 app.get('/api/menu', async (req, res) => {
     try {
         const [items] = await pool.execute('SELECT * FROM menu_items ORDER BY category, name');
