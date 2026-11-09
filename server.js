@@ -37,7 +37,8 @@ const initializeDB = async () => {
         'ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN last_updated DATETIME DEFAULT NULL',
-        'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL'
+        'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL'
     ];
 
     for (let query of columnsToAdd) {
@@ -86,6 +87,16 @@ io.on('connection', (socket) => {
     socket.on('join_order', (orderId) => { socket.join(`order_${orderId}`); });
     socket.on('send_message', async (data) => {
         try {
+            const [orders] = await pool.execute(
+                `SELECT status, chat_expires_at > CURRENT_TIMESTAMP AS chat_time_remaining
+                 FROM orders WHERE id = ?`,
+                [data.orderId]
+            );
+            const order = orders[0];
+            if (!order || order.status === 'Cancelled' || (order.status === 'Completed' && !order.chat_time_remaining)) {
+                io.to(`order_${data.orderId}`).emit('chat_closed', { orderId: data.orderId });
+                return;
+            }
             await pool.execute('INSERT INTO order_chats (order_id, sender, message) VALUES (?, ?, ?)', [data.orderId, data.sender, data.text]);
             io.to(`order_${data.orderId}`).emit('receive_message', data);
         } catch (error) { console.error('Socket DB Insert Error:', error); }
@@ -321,7 +332,8 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
 
 app.get('/api/orders', authenticateToken, async (req, res) => {
     try {
-        const [orders] = await pool.execute('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC', [req.user.id]);
+        const [orders] = await pool.execute(`SELECT *, UNIX_TIMESTAMP(chat_expires_at) * 1000 AS chat_expires_at_ms
+            FROM orders WHERE user_id = ? ORDER BY created_at DESC`, [req.user.id]);
         for (let order of orders) {
             const [items] = await pool.execute("SELECT item_name as name, quantity as qty, price FROM order_items WHERE order_id = ?", [order.id]);
             order.items = items;
@@ -333,7 +345,8 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
 
 app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
-        const [orders] = await pool.execute(`SELECT o.*, u.firstname, u.lastname, u.email FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC`);
+        const [orders] = await pool.execute(`SELECT o.*, UNIX_TIMESTAMP(o.chat_expires_at) * 1000 AS chat_expires_at_ms,
+            u.firstname, u.lastname, u.email FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC`);
         for (let order of orders) {
             const [items] = await pool.execute("SELECT item_name as name, quantity as qty, price FROM order_items WHERE order_id = ?", [order.id]);
             order.itemsData = items;
@@ -347,7 +360,13 @@ app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, 
 
 app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
-        await pool.execute('UPDATE orders SET status = ? WHERE id = ?', [req.body.status, req.params.id]);
+        await pool.execute(`UPDATE orders SET status = ?, chat_expires_at = CASE
+            WHEN ? = 'Completed' THEN CASE
+                WHEN status = 'Completed' AND chat_expires_at IS NOT NULL THEN chat_expires_at
+                ELSE DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE)
+            END
+            ELSE NULL
+        END WHERE id = ?`, [req.body.status, req.body.status, req.params.id]);
         await logActivity(req.user.id, `Updated order O-${String(req.params.id).padStart(4, '0')} status to ${req.body.status}`);
         
         io.emit('dashboard_refresh'); 
