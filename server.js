@@ -48,13 +48,15 @@ const initializeDB = async () => {
         }
     }
 
-    try {
-        const [paymentColumns] = await pool.execute("SHOW COLUMNS FROM orders LIKE 'payment_method'");
-        if (paymentColumns[0]?.Type?.toLowerCase().startsWith('enum(')) {
-            await pool.execute('ALTER TABLE orders MODIFY payment_method VARCHAR(50) NOT NULL');
+    for (const column of ['payment_method', 'order_type']) {
+        try {
+            const [columns] = await pool.execute(`SHOW COLUMNS FROM orders LIKE '${column}'`);
+            if (columns[0]?.Type?.toLowerCase().startsWith('enum(')) {
+                await pool.execute(`ALTER TABLE orders MODIFY ${column} VARCHAR(50) NOT NULL`);
+            }
+        } catch (e) {
+            console.error(`Failed to prepare orders.${column} for supported order values`, e);
         }
-    } catch (e) {
-        console.error('Failed to prepare orders.payment_method for cash payments', e);
     }
 
     try {
