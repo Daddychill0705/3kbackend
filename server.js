@@ -256,12 +256,21 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/orders', authenticateToken, async (req, res) => {
-    const { items, totalAmount, orderType, branch, address, phone, paymentMethod, notes, receipt_url } = req.body;
-    const parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
-    if (!parsedItems || parsedItems.length === 0) return res.status(400).json({ error: 'Cart is empty' });
-
-    const connection = await pool.getConnection();
+    let connection;
     try {
+        const { items, totalAmount, orderType, branch, address, phone, paymentMethod, notes, receipt_url } = req.body;
+        const parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
+        if (!Array.isArray(parsedItems) || parsedItems.length === 0) {
+            return res.status(400).json({ error: 'Cart is empty' });
+        }
+        if (!Number.isFinite(Number(totalAmount)) || Number(totalAmount) <= 0) {
+            return res.status(400).json({ error: 'Order total is invalid' });
+        }
+        if (parsedItems.some(item => !item.name || !Number.isFinite(Number(item.qty)) || Number(item.qty) <= 0 || !Number.isFinite(Number(item.price)))) {
+            return res.status(400).json({ error: 'One or more cart items are invalid. Please refresh your cart and try again.' });
+        }
+
+        connection = await pool.getConnection();
         await connection.beginTransaction();
         const [orderResult] = await connection.execute(
             `INSERT INTO orders (user_id, total_amount, order_type, branch, delivery_address, contact_number, payment_method, gcash_receipt_url, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -277,9 +286,23 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         io.emit('dashboard_refresh'); 
         res.status(201).json({ message: 'Order placed', orderId: orderResult.insertId });
     } catch (error) {
-        await connection.rollback();
-        res.status(500).json({ error: 'Failed to place order' });
-    } finally { connection.release(); }
+        if (connection) {
+            try { await connection.rollback(); } catch (rollbackError) {
+                console.error('Failed to roll back order transaction', rollbackError);
+            }
+        }
+        console.error('Failed to place order', {
+            code: error.code,
+            message: error.message,
+            userId: req.user?.id
+        });
+        res.status(500).json({
+            error: 'We could not save this order. Please try again.',
+            code: error.code || 'ORDER_CREATE_FAILED'
+        });
+    } finally {
+        if (connection) connection.release();
+    }
 });
 
 app.get('/api/orders', authenticateToken, async (req, res) => {
