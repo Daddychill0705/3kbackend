@@ -232,7 +232,13 @@ app.post('/api/guest', async (req, res) => {
         }
         const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
         res.json({ token, user: { id: user.id, name: `${user.firstname} ${user.lastname}`, email: user.email, role: user.role, phone: '', dob: '', branch: '', last_updated: null } });
-    } catch (error) { res.status(500).json({ error: 'Guest login failed.' }); }
+    } catch (error) {
+        console.error('Failed to create kiosk guest session', {
+            code: error.code,
+            message: error.message
+        });
+        res.status(500).json({ error: 'Guest login failed.', code: error.code || 'GUEST_SESSION_FAILED' });
+    }
 });
 
 app.put('/api/users/profile', authenticateToken, async (req, res) => {
