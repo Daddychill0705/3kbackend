@@ -269,6 +269,12 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         if (parsedItems.some(item => !item.name || !Number.isFinite(Number(item.qty)) || Number(item.qty) <= 0 || !Number.isFinite(Number(item.price)))) {
             return res.status(400).json({ error: 'One or more cart items are invalid. Please refresh your cart and try again.' });
         }
+        if (['Delivery', 'Pick-up'].includes(orderType) && paymentMethod !== 'GCash') {
+            return res.status(400).json({ error: 'Online orders require GCash payment.' });
+        }
+        if (['Delivery', 'Pick-up'].includes(orderType) && !receipt_url) {
+            return res.status(400).json({ error: 'Please upload your GCash payment receipt.' });
+        }
 
         connection = await pool.getConnection();
         await connection.beginTransaction();
