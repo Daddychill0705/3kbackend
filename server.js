@@ -49,6 +49,15 @@ const initializeDB = async () => {
     }
 
     try {
+        const [paymentColumns] = await pool.execute("SHOW COLUMNS FROM orders LIKE 'payment_method'");
+        if (paymentColumns[0]?.Type?.toLowerCase().startsWith('enum(')) {
+            await pool.execute('ALTER TABLE orders MODIFY payment_method VARCHAR(50) NOT NULL');
+        }
+    } catch (e) {
+        console.error('Failed to prepare orders.payment_method for cash payments', e);
+    }
+
+    try {
         await pool.execute(`CREATE TABLE IF NOT EXISTS activity_logs (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_name VARCHAR(255) NOT NULL,
@@ -312,11 +321,20 @@ app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, a
 app.put('/api/admin/orders/:id/payment', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('UPDATE orders SET payment_method = ? WHERE id = ?', [req.body.paymentMethod, req.params.id]);
+        const [orders] = await pool.execute('SELECT payment_method FROM orders WHERE id = ?', [req.params.id]);
+        if (!orders.length) return res.status(404).json({ error: 'Order not found' });
+        if (orders[0]?.payment_method !== req.body.paymentMethod) {
+            return res.status(500).json({ error: 'Payment method was not saved' });
+        }
+
         await logActivity(req.user.id, `Processed payment for order O-${String(req.params.id).padStart(4, '0')}`);
         
         io.emit('dashboard_refresh'); 
         res.json({ message: 'Payment method updated' });
-    } catch (error) { res.status(500).json({ error: 'Failed to update payment method' }); }
+    } catch (error) {
+        console.error('Failed to update payment method', error);
+        res.status(500).json({ error: 'Failed to update payment method' });
+    }
 });
 
 app.get('/api/menu', async (req, res) => {
