@@ -3,6 +3,8 @@ const cors = require('cors');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -32,12 +34,37 @@ const upload = multer({ storage });
 
 const pool = mysql.createPool(process.env.TIDB_URI);
 
+const getBrevoTransport = () => {
+    const host = process.env.BREVO_SMTP_HOST || 'smtp-relay.brevo.com';
+    const port = Number(process.env.BREVO_SMTP_PORT || 587);
+    const user = process.env.BREVO_SMTP_USER;
+    const pass = process.env.BREVO_SMTP_KEY;
+    if (!user || !pass) throw new Error('Brevo SMTP credentials are not configured.');
+    return nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } });
+};
+
+const sendPasswordResetEmail = async (email, resetUrl) => {
+    const transporter = getBrevoTransport();
+    const fromEmail = process.env.BREVO_SENDER_EMAIL;
+    if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
+    const fromName = process.env.BREVO_SENDER_NAME || '3K Kitchen';
+    await transporter.sendMail({
+        from: { name: fromName, address: fromEmail },
+        to: email,
+        subject: 'Reset your 3K Kitchen password',
+        text: `We received a request to reset your 3K Kitchen password. Open this link within 30 minutes to choose a new password: ${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Reset your password</h1><p>We received a request to reset your 3K Kitchen password.</p><p><a href="${resetUrl}" style="display:inline-block;padding:12px 20px;background:#815633;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold">Choose a new password</a></p><p>This link expires in 30 minutes. If you did not request this, you can ignore this email.</p></div>`
+    });
+};
+
 const initializeDB = async () => {
     const columnsToAdd = [
         'ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN last_updated DATETIME DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL',
+        'ALTER TABLE users ADD COLUMN password_reset_token_hash CHAR(64) DEFAULT NULL',
+        'ALTER TABLE users ADD COLUMN password_reset_expires_at DATETIME DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN customer_name VARCHAR(255) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN gcash_reference VARCHAR(13) DEFAULT NULL',
@@ -240,6 +267,71 @@ app.post('/api/register', async (req, res) => {
         );
         res.status(201).json({ message: 'User created successfully' });
     } catch (error) { res.status(500).json({ error: 'Registration failed or email exists.' }); }
+});
+
+app.post('/api/forgot-password', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Enter a valid email address.' });
+    }
+
+    try {
+        getBrevoTransport();
+        if (!process.env.BREVO_SENDER_EMAIL) throw new Error('BREVO_SENDER_EMAIL is not configured.');
+    } catch (error) {
+        console.error('Brevo SMTP is not configured:', error.message);
+        return res.status(503).json({ error: 'Email service is unavailable. Please try again later.' });
+    }
+
+    try {
+        const [users] = await pool.execute('SELECT id, email FROM users WHERE email = ? LIMIT 1', [email]);
+        if (users.length) {
+            const userId = users[0].id;
+            const resetToken = crypto.randomBytes(32).toString('hex');
+            const tokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+            await pool.execute(
+                'UPDATE users SET password_reset_token_hash = ?, password_reset_expires_at = DATE_ADD(NOW(), INTERVAL 30 MINUTE) WHERE id = ?',
+                [tokenHash, userId]
+            );
+            const appUrl = String(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+            try {
+                await sendPasswordResetEmail(email, `${appUrl}/reset-password/${resetToken}`);
+            } catch (mailError) {
+                await pool.execute('UPDATE users SET password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE id = ? AND password_reset_token_hash = ?', [userId, tokenHash]);
+                console.error('Password reset email could not be sent:', mailError.message);
+            }
+        }
+        // Do not disclose whether the address has an account.
+        return res.json({ message: 'If an account exists for that email, a password reset link has been sent.' });
+    } catch (error) {
+        console.error('Password reset request failed:', error.message);
+        return res.status(500).json({ error: 'Could not process the password reset request. Please try again.' });
+    }
+});
+
+app.post('/api/reset-password', async (req, res) => {
+    const token = String(req.body?.token || '');
+    const password = req.body?.password;
+    if (!/^[a-f0-9]{64}$/i.test(token)) {
+        return res.status(400).json({ error: 'This password reset link is invalid or expired.' });
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 128) {
+        return res.status(400).json({ error: 'Password must be between 8 and 128 characters.' });
+    }
+
+    try {
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const [result] = await pool.execute(
+            'UPDATE users SET password = ?, password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE password_reset_token_hash = ? AND password_reset_expires_at > NOW()',
+            [hashedPassword, tokenHash]
+        );
+        if (!result.affectedRows) return res.status(400).json({ error: 'This password reset link is invalid or expired.' });
+        return res.json({ message: 'Password reset successfully. You can now sign in.' });
+    } catch (error) {
+        console.error('Password reset failed:', error.message);
+        return res.status(500).json({ error: 'Could not reset the password. Please try again.' });
+    }
 });
 
 app.post('/api/login', async (req, res) => {
