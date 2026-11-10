@@ -123,6 +123,17 @@ const verifyAdminOrStaff = (req, res, next) => {
     else res.status(403).json({ error: 'Staff access required' });
 };
 
+const verifyAdminOnly = (req, res, next) => {
+    if (req.user?.role === 'admin') next();
+    else res.status(403).json({ error: 'Administrator access required' });
+};
+
+const verifyCurrentAdminPassword = async (userId, password) => {
+    if (typeof password !== 'string' || !password) return false;
+    const [admins] = await pool.execute('SELECT password, role FROM users WHERE id = ?', [userId]);
+    return admins[0]?.role === 'admin' && bcrypt.compare(password, admins[0].password);
+};
+
 app.get('/', (req, res) => res.send('3K Kitchen API is running successfully!'));
 
 app.get('/api/admin/activity-logs', authenticateToken, verifyAdminOrStaff, async (req, res) => {
@@ -147,9 +158,15 @@ app.get('/api/admin/customers', authenticateToken, verifyAdminOrStaff, async (re
     } catch (error) { res.status(500).json({ error: 'Failed to fetch customers' }); }
 });
 
-app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, res) => {
-    const { firstname, lastname, email, password, role, branch } = req.body;
+app.post('/api/admin/users', authenticateToken, verifyAdminOnly, async (req, res) => {
+    const { firstname, lastname, email, password, role, branch, adminPassword } = req.body;
     try {
+        if (!['admin', 'cashier'].includes(role)) {
+            return res.status(400).json({ error: 'New accounts must be an admin or cashier.' });
+        }
+        if (!await verifyCurrentAdminPassword(req.user.id, adminPassword)) {
+            return res.status(403).json({ error: 'The admin password is incorrect.' });
+        }
         const hashedPassword = await bcrypt.hash(password, 10);
         await pool.execute(
             'INSERT INTO users (firstname, lastname, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)',
@@ -163,8 +180,19 @@ app.post('/api/admin/users', authenticateToken, verifyAdminOrStaff, async (req, 
 });
 
 app.put('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
-    const { firstname, lastname, email, password, role, branch } = req.body;
+    const { firstname, lastname, email, password, role, branch, adminPassword } = req.body;
     try {
+        if (!['admin', 'cashier', 'rider'].includes(role)) {
+            return res.status(400).json({ error: 'Invalid staff role.' });
+        }
+        const [targetUsers] = await pool.execute('SELECT role FROM users WHERE id = ?', [req.params.id]);
+        if (!targetUsers.length) return res.status(404).json({ error: 'Account not found.' });
+        if ((role === 'admin' || targetUsers[0].role === 'admin') && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Only an administrator can manage admin accounts.' });
+        }
+        if (role === 'admin' && !await verifyCurrentAdminPassword(req.user.id, adminPassword)) {
+            return res.status(403).json({ error: 'The admin password is incorrect.' });
+        }
         if (password && password.trim() !== '') {
             const hashedPassword = await bcrypt.hash(password, 10);
             await pool.execute(
@@ -182,8 +210,16 @@ app.put('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (re
     } catch (error) { res.status(500).json({ error: 'Failed to update user.' }); }
 });
 
-app.delete('/api/admin/users/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+app.delete('/api/admin/users/:id', authenticateToken, verifyAdminOnly, async (req, res) => {
     try {
+        const [targetUsers] = await pool.execute('SELECT id, role FROM users WHERE id = ?', [req.params.id]);
+        if (!targetUsers.length) return res.status(404).json({ error: 'Account not found.' });
+        if (Number(req.params.id) === Number(req.user.id)) {
+            return res.status(400).json({ error: 'You cannot delete your own admin account.' });
+        }
+        if (targetUsers[0].role === 'admin' && !await verifyCurrentAdminPassword(req.user.id, req.body?.adminPassword)) {
+            return res.status(403).json({ error: 'The admin password is incorrect.' });
+        }
         await pool.execute('DELETE FROM users WHERE id = ?', [req.params.id]);
         await logActivity(req.user.id, `Deleted account ID: ${req.params.id}`);
         res.json({ message: 'User deleted' });
