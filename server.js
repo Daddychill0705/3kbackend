@@ -57,6 +57,33 @@ const sendPasswordResetEmail = async (email, resetUrl) => {
     });
 };
 
+const sendRecoveryDeniedEmail = async (email, note = '') => {
+    const transporter = getBrevoTransport();
+    const fromEmail = process.env.BREVO_SENDER_EMAIL;
+    if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
+    const fromName = process.env.BREVO_SENDER_NAME || '3K Kitchen';
+    const decisionText = `Your 3K Kitchen account recovery request was denied.${note ? ` Admin note: ${note}` : ''}`;
+    await transporter.sendMail({
+        from: { name: fromName, address: fromEmail },
+        to: email,
+        subject: '3K Kitchen account recovery update',
+        text: `${decisionText}\n\nIf you did not submit this request, contact 3K Kitchen support.`
+    });
+};
+
+const sendRecoveryApprovedEmail = async (email, resetUrl) => {
+    const transporter = getBrevoTransport();
+    const fromEmail = process.env.BREVO_SENDER_EMAIL;
+    if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
+    await transporter.sendMail({
+        from: { name: process.env.BREVO_SENDER_NAME || '3K Kitchen', address: fromEmail },
+        to: email,
+        subject: '3K Kitchen account recovery approved',
+        text: `Your account recovery was approved. Use this link within 30 minutes to set a new password: ${resetUrl}\n\nIf you did not submit this request, contact 3K Kitchen support.`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Recovery approved</h1><p>Your 3K Kitchen account recovery request was approved.</p><p><a href="${resetUrl}" style="display:inline-block;padding:12px 20px;background:#815633;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold">Reset your password</a></p><p>This link expires in 30 minutes. If you did not submit this request, contact 3K Kitchen support.</p></div>`
+    });
+};
+
 const initializeDB = async () => {
     const columnsToAdd = [
         'ALTER TABLE users ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
@@ -100,6 +127,25 @@ const initializeDB = async () => {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
     } catch (e) { console.error('Failed to create activity_logs table', e); }
+
+    try {
+        await pool.execute(`CREATE TABLE IF NOT EXISTS account_recovery_requests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            account_email VARCHAR(255) NOT NULL,
+            account_name VARCHAR(255) NOT NULL,
+            registered_phone VARCHAR(50) NOT NULL,
+            registered_dob DATE DEFAULT NULL,
+            new_email VARCHAR(255) NOT NULL,
+            account_details TEXT,
+            status VARCHAR(20) NOT NULL DEFAULT 'Pending',
+            review_note VARCHAR(1000) DEFAULT NULL,
+            reviewed_by INT DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewed_at DATETIME DEFAULT NULL,
+            INDEX idx_recovery_status_created (status, created_at),
+            INDEX idx_recovery_email (account_email)
+        )`);
+    } catch (e) { console.error('Failed to create account_recovery_requests table', e); }
 };
 const databaseReady = initializeDB();
 
@@ -331,6 +377,119 @@ app.post('/api/reset-password', async (req, res) => {
     } catch (error) {
         console.error('Password reset failed:', error.message);
         return res.status(500).json({ error: 'Could not reset the password. Please try again.' });
+    }
+});
+
+app.post('/api/account-recovery', async (req, res) => {
+    const accountName = String(req.body?.accountName || '').trim();
+    const accountEmail = String(req.body?.accountEmail || '').trim().toLowerCase();
+    const registeredPhone = String(req.body?.registeredPhone || '').trim();
+    const registeredDob = String(req.body?.registeredDob || '').trim();
+    const newEmail = String(req.body?.newEmail || '').trim().toLowerCase();
+    const accountDetails = String(req.body?.accountDetails || '').trim();
+    const validEmail = value => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+
+    if (!accountName || accountName.length > 255 || !validEmail(accountEmail) || accountEmail.length > 255 || !validEmail(newEmail) || newEmail.length > 255 || accountEmail === newEmail || !registeredPhone || registeredPhone.length > 50 || accountDetails.length > 1000) {
+        return res.status(400).json({ error: 'Check the account information and make sure all required fields are valid.' });
+    }
+    if (registeredDob && !/^\d{4}-\d{2}-\d{2}$/.test(registeredDob)) {
+        return res.status(400).json({ error: 'Enter the registered date of birth.' });
+    }
+
+    try {
+        const [pending] = await pool.execute('SELECT id FROM account_recovery_requests WHERE account_email = ? AND status = "Pending" LIMIT 1', [accountEmail]);
+        if (!pending.length) {
+            await pool.execute(
+                'INSERT INTO account_recovery_requests (account_email, account_name, registered_phone, registered_dob, new_email, account_details) VALUES (?, ?, ?, ?, ?, ?)',
+                [accountEmail, accountName, registeredPhone, registeredDob || null, newEmail, accountDetails || null]
+            );
+        }
+        return res.status(201).json({ message: 'Your recovery request was sent for admin review. You will receive an email at the updated address after it is reviewed.' });
+    } catch (error) {
+        console.error('Account recovery request could not be saved:', error.message);
+        return res.status(500).json({ error: 'Could not submit the recovery request. Please try again later.' });
+    }
+});
+
+app.get('/api/admin/account-recovery', authenticateToken, verifyAdminOnly, async (req, res) => {
+    try {
+        const [requests] = await pool.execute(`SELECT r.id, r.account_email, r.account_name, r.registered_phone,
+            DATE_FORMAT(r.registered_dob, '%Y-%m-%d') AS registered_dob, r.new_email, r.account_details,
+            r.status, r.review_note, r.created_at, r.reviewed_at, u.firstname AS reviewer_firstname, u.lastname AS reviewer_lastname,
+            account.id AS matched_account_id, account.firstname AS matched_firstname, account.lastname AS matched_lastname,
+            account.phone AS matched_phone, DATE_FORMAT(account.dob, '%Y-%m-%d') AS matched_dob
+            FROM account_recovery_requests r LEFT JOIN users u ON u.id = r.reviewed_by
+            LEFT JOIN users account ON account.email = r.account_email
+            ORDER BY CASE WHEN r.status = 'Pending' THEN 0 ELSE 1 END, r.created_at DESC`);
+        return res.json(requests);
+    } catch (error) {
+        console.error('Failed to load account recovery requests:', error.message);
+        return res.status(500).json({ error: 'Could not load account recovery requests.' });
+    }
+});
+
+app.put('/api/admin/account-recovery/:id', authenticateToken, verifyAdminOnly, async (req, res) => {
+    const decision = req.body?.decision;
+    const adminPassword = req.body?.adminPassword;
+    const reviewNote = String(req.body?.reviewNote || '').trim().slice(0, 1000);
+    if (!['Approved', 'Denied'].includes(decision)) return res.status(400).json({ error: 'Choose approve or deny.' });
+    if (!await verifyCurrentAdminPassword(req.user.id, adminPassword)) return res.status(403).json({ error: 'The admin password is incorrect.' });
+
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [rows] = await connection.execute('SELECT * FROM account_recovery_requests WHERE id = ? FOR UPDATE', [req.params.id]);
+        const request = rows[0];
+        if (!request) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Recovery request not found.' });
+        }
+        if (request.status !== 'Pending') {
+            await connection.rollback();
+            return res.status(409).json({ error: 'This recovery request has already been reviewed.' });
+        }
+
+        if (decision === 'Approved') {
+            const [accounts] = await connection.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [request.account_email]);
+            if (!accounts.length) {
+                await connection.rollback();
+                return res.status(404).json({ error: 'No account matches the submitted account email. Verify the details before approving.' });
+            }
+            const accountId = accounts[0].id;
+            const [emailConflicts] = await connection.execute('SELECT id FROM users WHERE email = ? AND id <> ? LIMIT 1', [request.new_email, accountId]);
+            if (emailConflicts.length) {
+                await connection.rollback();
+                return res.status(409).json({ error: 'The updated email already belongs to another account.' });
+            }
+
+            const resetToken = crypto.randomBytes(32).toString('hex');
+            const tokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+            await connection.execute(
+                'UPDATE users SET email = ?, password_reset_token_hash = ?, password_reset_expires_at = DATE_ADD(NOW(), INTERVAL 30 MINUTE) WHERE id = ?',
+                [request.new_email, tokenHash, accountId]
+            );
+            const appUrl = String(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+            await sendRecoveryApprovedEmail(request.new_email, `${appUrl}/reset-password/${resetToken}`);
+        } else {
+            await sendRecoveryDeniedEmail(request.new_email, reviewNote);
+        }
+
+        await connection.execute(
+            'UPDATE account_recovery_requests SET status = ?, review_note = ?, reviewed_by = ?, reviewed_at = NOW() WHERE id = ?',
+            [decision, reviewNote || null, req.user.id, request.id]
+        );
+        await connection.commit();
+        await logActivity(req.user.id, `${decision} account recovery request #${request.id}`);
+        return res.json({ message: decision === 'Approved' ? 'Recovery approved. A password reset email was sent to the updated address.' : 'Recovery denied. A notice was sent to the updated address.' });
+    } catch (error) {
+        if (connection) {
+            try { await connection.rollback(); } catch (rollbackError) { console.error('Could not roll back account recovery review.'); }
+        }
+        console.error('Account recovery review failed:', error.message);
+        return res.status(503).json({ error: 'Could not complete the review or send its email. The request remains available for review.' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
