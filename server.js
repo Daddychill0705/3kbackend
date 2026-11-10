@@ -319,9 +319,15 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     try {
         const { items, totalAmount, orderType, branch, address, phone, paymentMethod, notes, receipt_url } = req.body;
         const { customerName, gcashReference, cashTendered } = req.body;
-        const isCounterSale = ['admin', 'cashier'].includes(req.user.role) && ['Dine-in', 'Take-out'].includes(orderType) && (
+        const isStaffCounterSale = ['admin', 'cashier'].includes(req.user.role) && ['Dine-in', 'Take-out'].includes(orderType) && (
             customerName !== undefined || gcashReference !== undefined || cashTendered !== undefined
         );
+        let isKioskCounterSale = false;
+        if (req.user.role === 'customer' && ['Dine-in', 'Take-out'].includes(orderType) && typeof address === 'string' && address.startsWith('Kiosk Customer:')) {
+            const [kioskUsers] = await pool.execute('SELECT email FROM users WHERE id = ?', [req.user.id]);
+            isKioskCounterSale = kioskUsers[0]?.email === 'guest@3kitchen.local';
+        }
+        const isCounterSale = isStaffCounterSale || isKioskCounterSale;
         const parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
         if (!Array.isArray(parsedItems) || parsedItems.length === 0) {
             return res.status(400).json({ error: 'Cart is empty' });
