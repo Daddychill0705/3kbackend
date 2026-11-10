@@ -405,7 +405,7 @@ app.get('/api/menu/best-sellers', async (req, res) => {
         const [items] = await pool.execute(`
             SELECT m.*, sales.total_sold
             FROM menu_items m
-            INNER JOIN (
+            LEFT JOIN (
                 SELECT oi.item_name, SUM(oi.quantity) AS total_sold
                 FROM order_items oi
                 INNER JOIN orders o ON o.id = oi.order_id
@@ -413,7 +413,7 @@ app.get('/api/menu/best-sellers', async (req, res) => {
                 GROUP BY oi.item_name
             ) sales ON LOWER(TRIM(sales.item_name)) = LOWER(TRIM(m.name))
             WHERE COALESCE(m.is_sold_out, 0) = 0
-            ORDER BY sales.total_sold DESC, m.name ASC
+            ORDER BY COALESCE(sales.total_sold, 0) DESC, m.name ASC
             LIMIT 3
         `);
         res.json(items);
