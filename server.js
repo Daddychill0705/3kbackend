@@ -4,6 +4,7 @@ const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const net = require('net');
 const nodemailer = require('nodemailer');
 const multer = require('multer');
 const path = require('path');
@@ -14,6 +15,7 @@ require('dotenv').config();
 
 const app = express();
 
+app.set('trust proxy', 1);
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -49,6 +51,105 @@ const getBrevoTransport = () => {
         greetingTimeout: 10000,
         socketTimeout: 30000
     });
+};
+
+const sendAppEmail = async ({ to, subject, text, html }) => {
+    const fromEmail = process.env.BREVO_SENDER_EMAIL;
+    if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
+    const transporter = getBrevoTransport();
+    return transporter.sendMail({
+        from: { name: process.env.BREVO_SENDER_NAME || '3K Kitchen', address: fromEmail },
+        to,
+        subject,
+        text,
+        html
+    });
+};
+
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+
+const makeOtpHash = (email, purpose, otp) => crypto.createHmac('sha256', process.env.JWT_SECRET || '3k-kitchen-otp')
+    .update(`${purpose}:${email}:${otp}`).digest('hex');
+
+const sendOtpEmail = async (email, otp, purpose) => {
+    const registration = purpose === 'register';
+    const heading = registration ? 'Verify your 3K Kitchen account' : 'Reset your 3K Kitchen password';
+    const description = registration
+        ? 'Enter this verification code to finish creating your account.'
+        : 'Enter this verification code to reset your password.';
+    await sendAppEmail({
+        to: email,
+        subject: registration ? 'Your 3K Kitchen sign-up code' : 'Your 3K Kitchen password reset code',
+        text: `${heading}\n\n${description}\n\nYour code is ${otp}. It expires in 10 minutes. If you did not request this, you can ignore this email.`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>${heading}</h1><p>${description}</p><p style="font-size:30px;font-weight:bold;letter-spacing:8px;color:#815633">${otp}</p><p>This code expires in 10 minutes. If you did not request this, you can ignore this email.</p></div>`
+    });
+};
+
+const sendAccountCreatedEmail = async email => sendAppEmail({
+    to: email,
+    subject: 'Welcome to 3K Kitchen',
+    text: 'Your 3K Kitchen account is ready. You can now sign in. If you did not create this account, contact 3K Kitchen support.',
+    html: '<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Welcome to 3K Kitchen!</h1><p>Your account is ready. You can now sign in.</p><p>If you did not create this account, contact 3K Kitchen support.</p></div>'
+});
+
+const isPublicIp = ip => {
+    const normalized = String(ip || '').replace(/^::ffff:/i, '');
+    const version = net.isIP(normalized);
+    if (version === 4) {
+        const parts = normalized.split('.').map(Number);
+        return !(parts[0] === 10 || parts[0] === 127 || parts[0] === 0 ||
+            (parts[0] === 169 && parts[1] === 254) ||
+            (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+            (parts[0] === 192 && parts[1] === 168) || parts[0] >= 224);
+    }
+    if (version === 6) return !(/^::1$|^fc|^fd|^fe80:/i.test(normalized));
+    return false;
+};
+
+const getApproximateIpLocation = async ip => {
+    if (!isPublicIp(ip)) return 'Unavailable (local or private network)';
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    try {
+        const response = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, { signal: controller.signal });
+        if (!response.ok) return 'Unavailable';
+        const data = await response.json();
+        return [data.city, data.region, data.country_name].filter(Boolean).join(', ') || 'Unavailable';
+    } catch (_) {
+        return 'Unavailable';
+    } finally {
+        clearTimeout(timeout);
+    }
+};
+
+const sendLoginAlert = async (user, ip) => {
+    const location = await getApproximateIpLocation(ip);
+    const signedInAt = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', dateStyle: 'medium', timeStyle: 'long' });
+    await sendAppEmail({
+        to: user.email,
+        subject: 'New sign-in to your 3K Kitchen account',
+        text: `A sign-in to your 3K Kitchen account was detected.\n\nTime: ${signedInAt}\nApproximate location: ${location}\nIP address: ${ip || 'Unavailable'}\n\nIf this was not you, reset your password and contact an administrator.`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>New sign-in detected</h1><p>A sign-in to your 3K Kitchen account was detected.</p><p><b>Time:</b> ${escapeHtml(signedInAt)}<br><b>Approximate location:</b> ${escapeHtml(location)}<br><b>IP address:</b> ${escapeHtml(ip || 'Unavailable')}</p><p>If this was not you, reset your password and contact an administrator.</p></div>`
+    });
+};
+
+const sendOnlineOrderEmails = async ({ orderId, userId, orderType, branch, totalAmount, paymentMethod, items }) => {
+    const [customers] = await pool.execute('SELECT firstname, lastname, email FROM users WHERE id = ? LIMIT 1', [userId]);
+    const customer = customers[0];
+    if (!customer || customer.email === 'guest@3kkitchen.local') return;
+    const orderNumber = `O-${String(orderId).padStart(4, '0')}`;
+    const lines = items.map(item => `${item.qty}x ${item.name} — PHP ${Number(item.price) * Number(item.qty)}`).join('\n');
+    const details = `Order ${orderNumber}\nCustomer: ${customer.firstname} ${customer.lastname}\nType: ${orderType}\nBranch: ${branch || 'Not specified'}\nPayment: ${paymentMethod || 'Not specified'}\nTotal: PHP ${Number(totalAmount).toFixed(2)}\n\n${lines}`;
+    const htmlItems = items.map(item => `<li>${escapeHtml(item.qty)}x ${escapeHtml(item.name)} — PHP ${(Number(item.price) * Number(item.qty)).toFixed(2)}</li>`).join('');
+    const baseHtml = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Order ${escapeHtml(orderNumber)}</h1><p><b>Customer:</b> ${escapeHtml(customer.firstname)} ${escapeHtml(customer.lastname)}<br><b>Type:</b> ${escapeHtml(orderType)}<br><b>Branch:</b> ${escapeHtml(branch || 'Not specified')}<br><b>Payment:</b> ${escapeHtml(paymentMethod || 'Not specified')}<br><b>Total:</b> PHP ${Number(totalAmount).toFixed(2)}</p><ul>${htmlItems}</ul></div>`;
+    const notifications = [];
+    notifications.push(sendAppEmail({ to: customer.email, subject: `3K Kitchen received your order ${orderNumber}`, text: `Your online order has been received. The kitchen will prepare it shortly.\n\n${details}`, html: `<p>Your online order has been received. The kitchen will prepare it shortly.</p>${baseHtml}` }));
+    const [staff] = await pool.execute('SELECT email FROM users WHERE role IN ("admin", "cashier") AND email IS NOT NULL AND email <> ""');
+    for (const member of staff) {
+        notifications.push(sendAppEmail({ to: member.email, subject: `New online order ${orderNumber}`, text: `A new online order is waiting for staff review.\n\n${details}`, html: `<p>A new online order is waiting for staff review.</p>${baseHtml}` }));
+    }
+    const results = await Promise.allSettled(notifications);
+    for (const result of results) if (result.status === 'rejected') console.error('Order email notification failed:', result.reason?.message || 'email error');
 };
 
 const sendPasswordResetEmail = async (email, resetUrl) => {
@@ -154,6 +255,21 @@ const initializeDB = async () => {
             INDEX idx_recovery_email (account_email)
         )`);
     } catch (e) { console.error('Failed to create account_recovery_requests table', e); }
+
+    try {
+        await pool.execute(`CREATE TABLE IF NOT EXISTS email_otp_challenges (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            email VARCHAR(255) NOT NULL,
+            purpose VARCHAR(32) NOT NULL,
+            code_hash CHAR(64) NOT NULL,
+            payload TEXT DEFAULT NULL,
+            attempts INT NOT NULL DEFAULT 0,
+            expires_at DATETIME NOT NULL,
+            consumed_at DATETIME DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_email_otp_email_purpose (email, purpose, created_at)
+        )`);
+    } catch (e) { console.error('Failed to create email_otp_challenges table', e); }
 };
 const databaseReady = initializeDB();
 
@@ -258,6 +374,7 @@ app.post('/api/admin/users', authenticateToken, verifyAdminOnly, async (req, res
             [firstname, lastname, email, hashedPassword, role, branch || null]
         );
         await logActivity(req.user.id, `Created new ${role} account: ${email}`);
+        sendAccountCreatedEmail(email).catch(mailError => console.error('Staff account-created email failed:', mailError.message));
         res.status(201).json({ message: 'User created successfully' });
     } catch (error) { 
         res.status(500).json({ error: 'Failed to create user. Email may already exist.' }); 
@@ -311,16 +428,153 @@ app.delete('/api/admin/users/:id', authenticateToken, verifyAdminOnly, async (re
     } catch (error) { res.status(500).json({ error: 'Failed to delete user' }); }
 });
 
-app.post('/api/register', async (req, res) => {
-    const { firstname, lastname, email, password, role } = req.body;
+app.post('/api/register', (req, res) => res.status(410).json({ error: 'Email verification is required. Request a sign-up code to create an account.' }));
+
+app.post('/api/register/request-otp', async (req, res) => {
+    const firstname = String(req.body?.firstname || '').trim();
+    const lastname = String(req.body?.lastname || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = req.body?.password;
+    if (!firstname || firstname.length > 100 || !lastname || lastname.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255 || typeof password !== 'string' || password.length < 8 || password.length > 128 || req.body?.termsAccepted !== true) {
+        return res.status(400).json({ error: 'Enter valid account details, use a password of at least 8 characters, and accept the Terms and Privacy Policy.' });
+    }
     try {
+        const [existing] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
+        if (existing.length) return res.status(409).json({ error: 'An account already uses this email address.' });
+        const [recent] = await pool.execute('SELECT id FROM email_otp_challenges WHERE email = ? AND purpose = "register" AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND) LIMIT 1', [email]);
+        if (recent.length) return res.status(429).json({ error: 'Please wait one minute before requesting another code.' });
         const hashedPassword = await bcrypt.hash(password, 10);
-        await pool.execute(
-            'INSERT INTO users (firstname, lastname, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)',
-            [firstname, lastname, email, hashedPassword, role || 'customer']
+        const payload = JSON.stringify({ firstname, lastname, email, password: hashedPassword });
+        const otp = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+        await pool.execute('UPDATE email_otp_challenges SET consumed_at = NOW() WHERE email = ? AND purpose = "register" AND consumed_at IS NULL', [email]);
+        const [inserted] = await pool.execute(
+            'INSERT INTO email_otp_challenges (email, purpose, code_hash, payload, expires_at) VALUES (?, "register", ?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE))',
+            [email, makeOtpHash(email, 'register', otp), payload]
         );
-        res.status(201).json({ message: 'User created successfully' });
-    } catch (error) { res.status(500).json({ error: 'Registration failed or email exists.' }); }
+        try {
+            await sendOtpEmail(email, otp, 'register');
+        } catch (mailError) {
+            await pool.execute('DELETE FROM email_otp_challenges WHERE id = ?', [inserted.insertId]);
+            console.error('Registration OTP email failed:', mailError.message);
+            return res.status(503).json({ error: 'Could not send the verification email. Please try again later.' });
+        }
+        return res.json({ message: 'A verification code was sent to your email. It expires in 10 minutes.' });
+    } catch (error) {
+        console.error('Registration OTP request failed:', error.message);
+        return res.status(500).json({ error: 'Could not start account registration. Please try again.' });
+    }
+});
+
+app.post('/api/register/verify-otp', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const otp = String(req.body?.otp || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) return res.status(400).json({ error: 'Enter the email address and 6-digit verification code.' });
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [challenges] = await connection.execute('SELECT * FROM email_otp_challenges WHERE email = ? AND purpose = "register" AND consumed_at IS NULL AND expires_at > NOW() ORDER BY id DESC LIMIT 1 FOR UPDATE', [email]);
+        const challenge = challenges[0];
+        if (!challenge || challenge.attempts >= 5) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'The verification code is invalid or expired. Request a new code.' });
+        }
+        if (!crypto.timingSafeEqual(Buffer.from(challenge.code_hash), Buffer.from(makeOtpHash(email, 'register', otp)))) {
+            await connection.execute('UPDATE email_otp_challenges SET attempts = attempts + 1 WHERE id = ?', [challenge.id]);
+            await connection.commit();
+            return res.status(400).json({ error: 'The verification code is incorrect.' });
+        }
+        const account = JSON.parse(challenge.payload || '{}');
+        const [existing] = await connection.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
+        if (existing.length) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'An account already uses this email address.' });
+        }
+        await connection.execute(
+            'INSERT INTO users (firstname, lastname, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, "customer", NULL, NULL, NULL)',
+            [account.firstname, account.lastname, email, account.password]
+        );
+        await connection.execute('UPDATE email_otp_challenges SET consumed_at = NOW() WHERE id = ?', [challenge.id]);
+        await connection.commit();
+        sendAccountCreatedEmail(email).catch(mailError => console.error('Account-created email failed:', mailError.message));
+        return res.status(201).json({ message: 'Your account has been verified and created. You can now sign in.' });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Registration OTP verification failed:', error.message);
+        return res.status(500).json({ error: 'Could not verify the account. Please try again.' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.post('/api/forgot-password/request-otp', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) return res.status(400).json({ error: 'Enter a valid email address.' });
+    try {
+        const [users] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
+        // Use the same response for known and unknown addresses to avoid account enumeration.
+        if (!users.length) return res.json({ message: 'If an account exists for that email, a reset code has been sent.' });
+        const [recent] = await pool.execute('SELECT id FROM email_otp_challenges WHERE email = ? AND purpose = "reset" AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND) LIMIT 1', [email]);
+        if (recent.length) return res.status(429).json({ error: 'Please wait one minute before requesting another code.' });
+        const otp = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+        await pool.execute('UPDATE email_otp_challenges SET consumed_at = NOW() WHERE email = ? AND purpose = "reset" AND consumed_at IS NULL', [email]);
+        const [inserted] = await pool.execute(
+            'INSERT INTO email_otp_challenges (email, purpose, code_hash, expires_at) VALUES (?, "reset", ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE))',
+            [email, makeOtpHash(email, 'reset', otp)]
+        );
+        try {
+            await sendOtpEmail(email, otp, 'reset');
+        } catch (mailError) {
+            await pool.execute('DELETE FROM email_otp_challenges WHERE id = ?', [inserted.insertId]);
+            console.error('Password reset OTP email failed:', mailError.message);
+            return res.status(503).json({ error: 'Could not send the verification email. Please try again later.' });
+        }
+        return res.json({ message: 'If an account exists for that email, a reset code has been sent.' });
+    } catch (error) {
+        console.error('Password reset OTP request failed:', error.message);
+        return res.status(500).json({ error: 'Could not process the password reset request.' });
+    }
+});
+
+app.post('/api/forgot-password/verify-otp', async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const otp = String(req.body?.otp || '').trim();
+    const password = req.body?.password;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp) || typeof password !== 'string' || password.length < 8 || password.length > 128) {
+        return res.status(400).json({ error: 'Enter a valid email, 6-digit code, and password of at least 8 characters.' });
+    }
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [challenges] = await connection.execute('SELECT * FROM email_otp_challenges WHERE email = ? AND purpose = "reset" AND consumed_at IS NULL AND expires_at > NOW() ORDER BY id DESC LIMIT 1 FOR UPDATE', [email]);
+        const challenge = challenges[0];
+        if (!challenge || challenge.attempts >= 5) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'The verification code is invalid or expired. Request a new code.' });
+        }
+        if (!crypto.timingSafeEqual(Buffer.from(challenge.code_hash), Buffer.from(makeOtpHash(email, 'reset', otp)))) {
+            await connection.execute('UPDATE email_otp_challenges SET attempts = attempts + 1 WHERE id = ?', [challenge.id]);
+            await connection.commit();
+            return res.status(400).json({ error: 'The verification code is incorrect.' });
+        }
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const [result] = await connection.execute('UPDATE users SET password = ?, password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE email = ?', [hashedPassword, email]);
+        if (!result.affectedRows) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'The verification code is invalid or expired. Request a new code.' });
+        }
+        await connection.execute('UPDATE email_otp_challenges SET consumed_at = NOW() WHERE id = ?', [challenge.id]);
+        await connection.commit();
+        sendAppEmail({ to: email, subject: 'Your 3K Kitchen password was changed', text: 'The password for your 3K Kitchen account was changed. If you did not make this change, contact an administrator.', html: '<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Password changed</h1><p>The password for your 3K Kitchen account was changed.</p><p>If you did not make this change, contact an administrator.</p></div>' }).catch(mailError => console.error('Password change notice email failed:', mailError.message));
+        return res.json({ message: 'Password reset successfully. You can now sign in.' });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Password reset OTP verification failed:', error.message);
+        return res.status(500).json({ error: 'Could not reset the password. Please try again.' });
+    } finally {
+        if (connection) connection.release();
+    }
 });
 
 app.post('/api/forgot-password', async (req, res) => {
@@ -376,11 +630,15 @@ app.post('/api/reset-password', async (req, res) => {
     try {
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
         const hashedPassword = await bcrypt.hash(password, 10);
+        const [matchingUsers] = await pool.execute('SELECT email FROM users WHERE password_reset_token_hash = ? AND password_reset_expires_at > NOW() LIMIT 1', [tokenHash]);
         const [result] = await pool.execute(
             'UPDATE users SET password = ?, password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE password_reset_token_hash = ? AND password_reset_expires_at > NOW()',
             [hashedPassword, tokenHash]
         );
         if (!result.affectedRows) return res.status(400).json({ error: 'This password reset link is invalid or expired.' });
+        if (matchingUsers[0]?.email) {
+            sendAppEmail({ to: matchingUsers[0].email, subject: 'Your 3K Kitchen password was changed', text: 'The password for your 3K Kitchen account was changed. If you did not make this change, contact an administrator.', html: '<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Password changed</h1><p>The password for your 3K Kitchen account was changed.</p><p>If you did not make this change, contact an administrator.</p></div>' }).catch(mailError => console.error('Password change notice email failed:', mailError.message));
+        }
         return res.json({ message: 'Password reset successfully. You can now sign in.' });
     } catch (error) {
         console.error('Password reset failed:', error.message);
@@ -518,6 +776,9 @@ app.post('/api/login', async (req, res) => {
             await logActivity(user.id, 'Logged into the system');
         }
 
+        const loginIp = String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/i, '') || 'Unavailable';
+        sendLoginAlert(user, loginIp).catch(mailError => console.error('Login alert email failed:', mailError.message));
+
         res.json({ 
             token, 
             user: { 
@@ -638,6 +899,18 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         await connection.commit();
         
         await logActivity(req.user.id, `Placed new order O-${String(orderResult.insertId).padStart(4, '0')}`);
+
+        if (['Delivery', 'Pick-up'].includes(orderType)) {
+            sendOnlineOrderEmails({
+                orderId: orderResult.insertId,
+                userId: req.user.id,
+                orderType,
+                branch,
+                totalAmount,
+                paymentMethod,
+                items: parsedItems
+            }).catch(mailError => console.error('Online order email notification failed:', mailError.message));
+        }
         
         io.emit('dashboard_refresh'); 
         res.status(201).json({ message: 'Order placed', orderId: orderResult.insertId });
@@ -838,6 +1111,26 @@ app.get('/api/admin/riders', authenticateToken, verifyAdminOrStaff, async (req, 
         const [riders] = await pool.execute('SELECT id, firstname, lastname, email, created_at FROM users WHERE role = "rider"');
         res.json(riders);
     } catch (error) { res.status(500).json({ error: 'Failed to fetch riders' }); }
+});
+
+app.post('/api/admin/riders', authenticateToken, verifyAdminOnly, async (req, res) => {
+    const firstname = String(req.body?.firstname || '').trim();
+    const lastname = String(req.body?.lastname || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = req.body?.password;
+    if (!firstname || !lastname || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || typeof password !== 'string' || password.length < 8 || password.length > 128) {
+        return res.status(400).json({ error: 'Enter a valid name, email, and password of at least 8 characters.' });
+    }
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        await pool.execute('INSERT INTO users (firstname, lastname, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, "rider", NULL, NULL, NULL)', [firstname, lastname, email, hashedPassword]);
+        await logActivity(req.user.id, `Created new rider account: ${email}`);
+        sendAccountCreatedEmail(email).catch(mailError => console.error('Rider account-created email failed:', mailError.message));
+        return res.status(201).json({ message: 'Rider account created successfully.' });
+    } catch (error) {
+        console.error('Rider account creation failed:', error.message);
+        return res.status(500).json({ error: 'Could not create the rider account. The email may already be in use.' });
+    }
 });
 
 app.get('/api/orders/:id/chat', authenticateToken, async (req, res) => {
