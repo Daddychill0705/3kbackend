@@ -400,6 +400,29 @@ app.get('/api/menu', async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Failed to fetch menu' }); }
 });
 
+app.get('/api/menu/best-sellers', async (req, res) => {
+    try {
+        const [items] = await pool.execute(`
+            SELECT m.*, sales.total_sold
+            FROM menu_items m
+            INNER JOIN (
+                SELECT oi.item_name, SUM(oi.quantity) AS total_sold
+                FROM order_items oi
+                INNER JOIN orders o ON o.id = oi.order_id
+                WHERE o.status <> 'Cancelled'
+                GROUP BY oi.item_name
+            ) sales ON LOWER(TRIM(sales.item_name)) = LOWER(TRIM(m.name))
+            WHERE COALESCE(m.is_sold_out, 0) = 0
+            ORDER BY sales.total_sold DESC, m.name ASC
+            LIMIT 3
+        `);
+        res.json(items);
+    } catch (error) {
+        console.error('Failed to fetch menu best sellers', error);
+        res.status(500).json({ error: 'Failed to fetch best sellers' });
+    }
+});
+
 app.post('/api/admin/menu', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('INSERT INTO menu_items (name, category, price, image_url) VALUES (?, ?, ?, ?)', [req.body.name, req.body.category, req.body.price, req.body.image_url || '/img/default-food.jpg']);
