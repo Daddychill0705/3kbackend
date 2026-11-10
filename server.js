@@ -38,7 +38,11 @@ const initializeDB = async () => {
         'ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN last_updated DATETIME DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL',
-        'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL'
+        'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN customer_name VARCHAR(255) DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN gcash_reference VARCHAR(13) DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN cash_tendered DECIMAL(10,2) DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN change_given DECIMAL(10,2) DEFAULT NULL'
     ];
 
     for (let query of columnsToAdd) {
@@ -70,7 +74,7 @@ const initializeDB = async () => {
         )`);
     } catch (e) { console.error('Failed to create activity_logs table', e); }
 };
-initializeDB();
+const databaseReady = initializeDB();
 
 // Helper to log activities
 const logActivity = async (userId, action) => {
@@ -314,6 +318,10 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     let connection;
     try {
         const { items, totalAmount, orderType, branch, address, phone, paymentMethod, notes, receipt_url } = req.body;
+        const { customerName, gcashReference, cashTendered } = req.body;
+        const isCounterSale = ['admin', 'cashier'].includes(req.user.role) && ['Dine-in', 'Take-out'].includes(orderType) && (
+            customerName !== undefined || gcashReference !== undefined || cashTendered !== undefined
+        );
         const parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
         if (!Array.isArray(parsedItems) || parsedItems.length === 0) {
             return res.status(400).json({ error: 'Cart is empty' });
@@ -330,12 +338,34 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         if (['Delivery', 'Pick-up'].includes(orderType) && paymentMethod === 'GCash' && !receipt_url) {
             return res.status(400).json({ error: 'Please upload your GCash payment receipt.' });
         }
+        if (gcashReference != null && !/^\d{13}$/.test(String(gcashReference))) {
+            return res.status(400).json({ error: 'GCash reference number must contain exactly 13 digits.' });
+        }
+        if (isCounterSale && paymentMethod === 'GCash' && !/^\d{13}$/.test(String(gcashReference || ''))) {
+            return res.status(400).json({ error: 'Enter a valid 13-digit GCash reference number.' });
+        }
+        if (isCounterSale && !['Cash', 'GCash'].includes(paymentMethod)) {
+            return res.status(400).json({ error: 'Counter sales must be paid by cash or GCash.' });
+        }
+        if (isCounterSale && paymentMethod === 'Cash' && (!Number.isFinite(Number(cashTendered)) || Number(cashTendered) < Number(totalAmount))) {
+            return res.status(400).json({ error: 'Cash tendered must cover the order total.' });
+        }
+        if (typeof customerName === 'string' && customerName.trim().length > 255) {
+            return res.status(400).json({ error: 'Customer calling name must be 255 characters or fewer.' });
+        }
+        if (customerName !== undefined && typeof customerName !== 'string') {
+            return res.status(400).json({ error: 'Customer calling name must be text.' });
+        }
+
+        const callingName = isCounterSale ? (String(customerName || '').trim() || 'Walk-in Customer') : null;
+        const tenderedAmount = isCounterSale && paymentMethod === 'Cash' ? Number(cashTendered) : null;
+        const changeAmount = tenderedAmount === null ? null : tenderedAmount - Number(totalAmount);
 
         connection = await pool.getConnection();
         await connection.beginTransaction();
         const [orderResult] = await connection.execute(
-            `INSERT INTO orders (user_id, total_amount, order_type, branch, delivery_address, contact_number, payment_method, gcash_receipt_url, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [req.user.id, totalAmount, orderType, branch, address || null, phone || null, paymentMethod, receipt_url || null, notes || null]
+            `INSERT INTO orders (user_id, total_amount, order_type, branch, delivery_address, contact_number, payment_method, gcash_receipt_url, notes, customer_name, gcash_reference, cash_tendered, change_given) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [req.user.id, totalAmount, orderType, branch, address || null, phone || null, paymentMethod, receipt_url || null, notes || null, callingName, isCounterSale && paymentMethod === 'GCash' ? gcashReference : null, tenderedAmount, changeAmount]
         );
         for (const item of parsedItems) {
             await connection.execute('INSERT INTO order_items (order_id, item_name, quantity, price) VALUES (?, ?, ?, ?)', [orderResult.insertId, item.name, item.qty, parseFloat(item.price)]);
@@ -412,10 +442,30 @@ app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, a
 
 app.put('/api/admin/orders/:id/payment', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
-        await pool.execute('UPDATE orders SET payment_method = ? WHERE id = ?', [req.body.paymentMethod, req.params.id]);
-        const [orders] = await pool.execute('SELECT payment_method FROM orders WHERE id = ?', [req.params.id]);
+        const { paymentMethod, cashTendered, gcashReference } = req.body;
+        const [existingOrders] = await pool.execute('SELECT total_amount FROM orders WHERE id = ?', [req.params.id]);
+        if (!existingOrders.length) return res.status(404).json({ error: 'Order not found' });
+        if (gcashReference != null && !/^\d{13}$/.test(String(gcashReference))) {
+            return res.status(400).json({ error: 'GCash reference number must contain exactly 13 digits.' });
+        }
+
+        let tenderedAmount = null;
+        let changeAmount = null;
+        if (paymentMethod === 'Cash' && cashTendered != null) {
+            tenderedAmount = Number(cashTendered);
+            if (!Number.isFinite(tenderedAmount) || tenderedAmount < Number(existingOrders[0].total_amount)) {
+                return res.status(400).json({ error: 'Cash tendered must cover the order total.' });
+            }
+            changeAmount = tenderedAmount - Number(existingOrders[0].total_amount);
+        }
+
+        await pool.execute(
+            'UPDATE orders SET payment_method = ?, cash_tendered = ?, change_given = ?, gcash_reference = ? WHERE id = ?',
+            [paymentMethod, tenderedAmount, changeAmount, paymentMethod === 'GCash' ? gcashReference || null : null, req.params.id]
+        );
+        const [orders] = await pool.execute('SELECT payment_method, cash_tendered, change_given, gcash_reference FROM orders WHERE id = ?', [req.params.id]);
         if (!orders.length) return res.status(404).json({ error: 'Order not found' });
-        if (orders[0]?.payment_method !== req.body.paymentMethod) {
+        if (orders[0]?.payment_method !== paymentMethod) {
             return res.status(500).json({ error: 'Payment method was not saved' });
         }
 
@@ -534,4 +584,9 @@ app.get('/api/orders/:id/chat', authenticateToken, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+databaseReady
+    .then(() => server.listen(PORT, () => console.log(`Server running on port ${PORT}`)))
+    .catch(error => {
+        console.error('Database initialization failed. Server was not started.', error);
+        process.exitCode = 1;
+    });
