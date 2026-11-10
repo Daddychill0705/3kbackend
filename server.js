@@ -40,7 +40,15 @@ const getBrevoTransport = () => {
     const user = process.env.BREVO_SMTP_USER;
     const pass = process.env.BREVO_SMTP_KEY;
     if (!user || !pass) throw new Error('Brevo SMTP credentials are not configured.');
-    return nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } });
+    return nodemailer.createTransport({
+        host,
+        port,
+        secure: port === 465,
+        auth: { user, pass },
+        connectionTimeout: 15000,
+        greetingTimeout: 10000,
+        socketTimeout: 30000
+    });
 };
 
 const sendPasswordResetEmail = async (email, resetUrl) => {
