@@ -1031,6 +1031,13 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
             isKioskCounterSale = kioskUsers[0]?.email === 'guest@3kitchen.local';
         }
         const isCounterSale = isStaffCounterSale || isKioskCounterSale;
+        const requestedBranch = String(branch || '').trim();
+        if (requestedBranch) {
+            const [branchRows] = await pool.execute('SELECT is_active FROM branches WHERE name = ?', [requestedBranch]);
+            if (branchRows.length > 0 && !(branchRows[0].is_active === true || Number(branchRows[0].is_active) === 1)) {
+                return res.status(400).json({ error: 'This branch is inactive and cannot receive orders right now.' });
+            }
+        }
         const parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
         if (!Array.isArray(parsedItems) || parsedItems.length === 0) {
             return res.status(400).json({ error: 'Cart is empty' });
