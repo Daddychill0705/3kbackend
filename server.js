@@ -165,25 +165,86 @@ const sendLoginAlert = async (user, ip) => {
     });
 };
 
-const sendOnlineOrderEmails = async ({ orderId, userId, orderType, branch, totalAmount, paymentMethod, items }) => {
+const getOrderEmailLinks = () => {
+    const appUrl = String(process.env.FRONTEND_URL || 'https://3kitchen.vercel.app').replace(/\/$/, '');
+    return { homeUrl: `${appUrl}/home`, ordersUrl: `${appUrl}/order`, menuUrl: `${appUrl}/menu` };
+};
+
+const makeOrderEmailLinksHtml = links => `<div style="margin:24px auto 0;max-width:560px;font-family:Arial,sans-serif"><a href="${escapeHtml(links.ordersUrl || links.menuUrl)}" style="display:inline-block;margin:0 8px 8px 0;padding:12px 18px;background:#815633;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold">${links.ordersUrl ? 'View my orders' : 'Try ordering again'}</a><a href="${escapeHtml(links.homeUrl)}" style="display:inline-block;margin:0 8px 8px 0;padding:12px 18px;border:1px solid #815633;color:#815633;text-decoration:none;border-radius:8px;font-weight:bold">Visit 3K Kitchen</a></div>`;
+
+const formatOrderItemsText = items => items.map(item => `${item.qty}x ${item.name} — PHP ${(Number(item.price) * Number(item.qty)).toFixed(2)}`).join('\n');
+const formatOrderItemsHtml = items => items.map(item => `<li>${escapeHtml(item.qty)}x ${escapeHtml(item.name)} — PHP ${(Number(item.price) * Number(item.qty)).toFixed(2)}</li>`).join('');
+
+const sendOnlineOrderEmails = async ({ orderId, userId, orderType, branch, address, phone, notes, totalAmount, paymentMethod, items }) => {
     const [customers] = await pool.execute('SELECT firstname, lastname, email FROM users WHERE id = ? LIMIT 1', [userId]);
     const customer = customers[0];
     if (!customer || customer.email === 'guest@3kkitchen.local') return;
     const orderNumber = `O-${String(orderId).padStart(4, '0')}`;
-    const lines = items.map(item => `${item.qty}x ${item.name} — PHP ${Number(item.price) * Number(item.qty)}`).join('\n');
-    const details = `Order ${orderNumber}\nCustomer: ${customer.firstname} ${customer.lastname}\nType: ${orderType}\nBranch: ${branch || 'Not specified'}\nPayment: ${paymentMethod || 'Not specified'}\nTotal: PHP ${Number(totalAmount).toFixed(2)}\n\n${lines}`;
-    const htmlItems = items.map(item => `<li>${escapeHtml(item.qty)}x ${escapeHtml(item.name)} — PHP ${(Number(item.price) * Number(item.qty)).toFixed(2)}</li>`).join('');
-    const baseHtml = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Order ${escapeHtml(orderNumber)}</h1><p><b>Customer:</b> ${escapeHtml(customer.firstname)} ${escapeHtml(customer.lastname)}<br><b>Type:</b> ${escapeHtml(orderType)}<br><b>Branch:</b> ${escapeHtml(branch || 'Not specified')}<br><b>Payment:</b> ${escapeHtml(paymentMethod || 'Not specified')}<br><b>Total:</b> PHP ${Number(totalAmount).toFixed(2)}</p><ul>${htmlItems}</ul></div>`;
-    const notifications = [];
-    notifications.push(sendAppEmail({ to: customer.email, subject: `3K Kitchen received your order ${orderNumber}`, text: `Your online order has been received. The kitchen will prepare it shortly.\n\n${details}`, html: `<p>Your online order has been received. The kitchen will prepare it shortly.</p>${baseHtml}` }));
+    const links = getOrderEmailLinks();
+    const lines = formatOrderItemsText(items);
+    const details = `Order ${orderNumber}\nCustomer: ${customer.firstname} ${customer.lastname}\nType: ${orderType}\nBranch: ${branch || 'Not specified'}\nDelivery address: ${address || 'Not provided'}\nContact number: ${phone || 'Not provided'}\nPayment: ${paymentMethod || 'Not specified'}\nTotal: PHP ${Number(totalAmount).toFixed(2)}${notes ? `\nOrder notes: ${notes}` : ''}\n\n${lines}`;
+    const htmlItems = formatOrderItemsHtml(items);
+    const orderDetailsHtml = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h2>Order ${escapeHtml(orderNumber)}</h2><p><b>Customer:</b> ${escapeHtml(customer.firstname)} ${escapeHtml(customer.lastname)}<br><b>Type:</b> ${escapeHtml(orderType)}<br><b>Branch:</b> ${escapeHtml(branch || 'Not specified')}<br><b>Delivery address:</b> ${escapeHtml(address || 'Not provided')}<br><b>Contact number:</b> ${escapeHtml(phone || 'Not provided')}<br><b>Payment:</b> ${escapeHtml(paymentMethod || 'Not specified')}<br><b>Total:</b> PHP ${Number(totalAmount).toFixed(2)}${notes ? `<br><b>Order notes:</b> ${escapeHtml(notes)}` : ''}</p><h3>Order details</h3><ul>${htmlItems}</ul></div>`;
+    const quickLinksText = `\n\nQuick links:\nView your orders: ${links.ordersUrl}\nVisit 3K Kitchen: ${links.homeUrl}`;
+    const notifications = [sendAppEmail({
+        to: customer.email,
+        subject: `Order ${orderNumber} received by 3K Kitchen`,
+        text: `We successfully received your online order. The cashier will review it and the kitchen will prepare it shortly.\n\n${details}${quickLinksText}`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>We received your order</h1><p>Your order was successfully received by 3K Kitchen. The cashier will review it and the kitchen will prepare it shortly.</p></div>${orderDetailsHtml}${makeOrderEmailLinksHtml(links)}`
+    })];
     const [staff] = await pool.execute('SELECT email FROM users WHERE role IN ("admin", "cashier") AND email IS NOT NULL AND email <> ""');
     for (const member of staff) {
-        notifications.push(sendAppEmail({ to: member.email, subject: `New online order ${orderNumber}`, text: `A new online order is waiting for staff review.\n\n${details}`, html: `<p>A new online order is waiting for staff review.</p>${baseHtml}` }));
+        notifications.push(sendAppEmail({ to: member.email, subject: `New online order ${orderNumber}`, text: `A new online order is waiting for staff review.\n\n${details}`, html: `<p>A new online order is waiting for staff review.</p>${orderDetailsHtml}` }));
     }
     const results = await Promise.allSettled(notifications);
     for (const result of results) if (result.status === 'rejected') console.error('Order email notification failed:', result.reason?.message || 'email error');
 };
 
+const sendOnlineOrderStatusEmail = async ({ orderId, status }) => {
+    const [rows] = await pool.execute(`SELECT o.id, o.order_type, o.branch, o.delivery_address, o.contact_number,
+        o.notes, o.payment_method, o.total_amount,
+        u.firstname, u.lastname, u.email
+        FROM orders o JOIN users u ON u.id = o.user_id WHERE o.id = ? LIMIT 1`, [orderId]);
+    const order = rows[0];
+    if (!order || order.email === 'guest@3kkitchen.local' || !['Delivery', 'Pick-up'].includes(order.order_type)) return;
+
+    const orderNumber = `O-${String(order.id).padStart(4, '0')}`;
+    const completed = status === 'Completed';
+    const heading = completed ? 'Your order is complete' : 'We could not complete your order';
+    const message = completed
+        ? 'Your order has been successfully completed. Thank you for choosing 3K Kitchen.'
+        : 'Unfortunately, we could not complete your order. Please contact the branch if you need help.';
+    const [items] = await pool.execute('SELECT item_name AS name, quantity AS qty, price FROM order_items WHERE order_id = ?', [order.id]);
+    const links = getOrderEmailLinks();
+    const lines = formatOrderItemsText(items);
+    const details = `Order: ${orderNumber}\nCustomer: ${order.firstname} ${order.lastname}\nType: ${order.order_type}\nBranch: ${order.branch || 'Not specified'}\nDelivery address: ${order.delivery_address || 'Not provided'}\nContact number: ${order.contact_number || 'Not provided'}\nPayment: ${order.payment_method || 'Not specified'}\nTotal: PHP ${Number(order.total_amount).toFixed(2)}${order.notes ? `\nOrder notes: ${order.notes}` : ''}\n\n${lines}`;
+    const htmlItems = formatOrderItemsHtml(items);
+    const quickLinksText = `\n\nQuick links:\nView your orders: ${links.ordersUrl}\nVisit 3K Kitchen: ${links.homeUrl}`;
+    await sendAppEmail({
+        to: order.email,
+        subject: `${heading} — ${orderNumber}`,
+        text: `${message}\n\n${details}${quickLinksText}`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>${escapeHtml(heading)}</h1><p>${escapeHtml(message)}</p><p><b>Order:</b> ${escapeHtml(orderNumber)}<br><b>Customer:</b> ${escapeHtml(order.firstname)} ${escapeHtml(order.lastname)}<br><b>Type:</b> ${escapeHtml(order.order_type)}<br><b>Branch:</b> ${escapeHtml(order.branch || 'Not specified')}<br><b>Delivery address:</b> ${escapeHtml(order.delivery_address || 'Not provided')}<br><b>Contact number:</b> ${escapeHtml(order.contact_number || 'Not provided')}<br><b>Payment:</b> ${escapeHtml(order.payment_method || 'Not specified')}<br><b>Total:</b> PHP ${Number(order.total_amount).toFixed(2)}${order.notes ? `<br><b>Order notes:</b> ${escapeHtml(order.notes)}` : ''}</p><h3>Order details</h3><ul>${htmlItems}</ul></div>${makeOrderEmailLinksHtml(links)}`
+    });
+};
+
+const sendOnlineOrderFailureEmail = async ({ userId, orderType, branch, address, phone, notes, paymentMethod, totalAmount, items }) => {
+    const [customers] = await pool.execute('SELECT firstname, lastname, email FROM users WHERE id = ? LIMIT 1', [userId]);
+    const customer = customers[0];
+    if (!customer || customer.email === 'guest@3kkitchen.local') return;
+    const links = getOrderEmailLinks();
+    const normalizedItems = Array.isArray(items) ? items : [];
+    const lines = formatOrderItemsText(normalizedItems);
+    const htmlItems = formatOrderItemsHtml(normalizedItems);
+    const details = `Customer: ${customer.firstname} ${customer.lastname}\nType: ${orderType}\nBranch: ${branch || 'Not specified'}\nDelivery address: ${address || 'Not provided'}\nContact number: ${phone || 'Not provided'}\nPayment: ${paymentMethod || 'Not specified'}\nTotal: PHP ${Number(totalAmount || 0).toFixed(2)}${notes ? `\nOrder notes: ${notes}` : ''}\n\n${lines}`;
+    const quickLinksText = `\n\nQuick links:\nTry ordering again: ${links.menuUrl}\nVisit 3K Kitchen: ${links.homeUrl}`;
+    await sendAppEmail({
+        to: customer.email,
+        subject: 'We could not save your 3K Kitchen order',
+        text: `We could not save your online order, so it was not sent to the cashier or kitchen. Please try again. If a payment was deducted, contact the branch before paying again.\n\n${details}${quickLinksText}`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Order not completed</h1><p>We could not save your online order, so it was not sent to the cashier or kitchen. Please try again.</p><p>If a payment was deducted, contact the branch before paying again.</p><p><b>Customer:</b> ${escapeHtml(customer.firstname)} ${escapeHtml(customer.lastname)}<br><b>Type:</b> ${escapeHtml(orderType)}<br><b>Branch:</b> ${escapeHtml(branch || 'Not specified')}<br><b>Delivery address:</b> ${escapeHtml(address || 'Not provided')}<br><b>Contact number:</b> ${escapeHtml(phone || 'Not provided')}<br><b>Payment:</b> ${escapeHtml(paymentMethod || 'Not specified')}<br><b>Total:</b> PHP ${Number(totalAmount || 0).toFixed(2)}${notes ? `<br><b>Order notes:</b> ${escapeHtml(notes)}` : ''}</p><ul>${htmlItems}</ul></div>${makeOrderEmailLinksHtml({ ...links, ordersUrl: null })}`
+    });
+};
 const sendPasswordResetEmail = async (email, resetUrl) => {
     await sendAppEmail({
         to: email,
@@ -943,6 +1004,7 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
 
 app.post('/api/orders', authenticateToken, async (req, res) => {
     let connection;
+    let orderCommitted = false;
     try {
         const { items, totalAmount, orderType, branch, address, phone, paymentMethod, notes, receipt_url } = req.body;
         const { customerName, gcashReference, cashTendered } = req.body;
@@ -1008,6 +1070,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
             await connection.execute('INSERT INTO order_items (order_id, item_name, quantity, price) VALUES (?, ?, ?, ?)', [orderResult.insertId, item.name, item.qty, parseFloat(item.price)]);
         }
         await connection.commit();
+        orderCommitted = true;
         
         await logActivity(req.user.id, `Placed new order ${orderNumber}`);
 
@@ -1017,6 +1080,9 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
                 userId: req.user.id,
                 orderType,
                 branch,
+                address,
+                phone,
+                notes,
                 totalAmount,
                 paymentMethod,
                 items: parsedItems
@@ -1030,6 +1096,23 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
             try { await connection.rollback(); } catch (rollbackError) {
                 console.error('Failed to roll back order transaction', rollbackError);
             }
+        }
+        if (!orderCommitted && req.user?.role === 'customer' && ['Delivery', 'Pick-up'].includes(req.body?.orderType)) {
+            let failedItems = req.body?.items;
+            if (typeof failedItems === 'string') {
+                try { failedItems = JSON.parse(failedItems); } catch (_) { failedItems = []; }
+            }
+            sendOnlineOrderFailureEmail({
+                userId: req.user.id,
+                orderType: req.body.orderType,
+                branch: req.body.branch,
+                address: req.body.address,
+                phone: req.body.phone,
+                notes: req.body.notes,
+                paymentMethod: req.body.paymentMethod,
+                totalAmount: req.body.totalAmount,
+                items: failedItems
+            }).catch(mailError => console.error('Failed order email notification failed:', mailError.message));
         }
         console.error('Failed to place order', {
             code: error.code,
@@ -1075,14 +1158,23 @@ app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, 
 
 app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
+        const nextStatus = String(req.body.status || '');
+        const [existingOrders] = await pool.execute('SELECT id, status, order_type FROM orders WHERE id = ? LIMIT 1', [req.params.id]);
+        if (!existingOrders.length) return res.status(404).json({ error: 'Order not found' });
+        const existingOrder = existingOrders[0];
         await pool.execute(`UPDATE orders SET status = ?, chat_expires_at = CASE
             WHEN ? = 'Completed' THEN CASE
                 WHEN status = 'Completed' AND chat_expires_at IS NOT NULL THEN chat_expires_at
                 ELSE DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE)
             END
             ELSE NULL
-        END WHERE id = ?`, [req.body.status, req.body.status, req.params.id]);
-        await logActivity(req.user.id, `Updated order O-${String(req.params.id).padStart(4, '0')} status to ${req.body.status}`);
+        END WHERE id = ?`, [nextStatus, nextStatus, req.params.id]);
+        await logActivity(req.user.id, `Updated order O-${String(req.params.id).padStart(4, '0')} status to ${nextStatus}`);
+
+        if (nextStatus !== existingOrder.status && ['Completed', 'Cancelled'].includes(nextStatus) && ['Delivery', 'Pick-up'].includes(existingOrder.order_type)) {
+            sendOnlineOrderStatusEmail({ orderId: existingOrder.id, status: nextStatus })
+                .catch(mailError => console.error('Order status email notification failed:', mailError.message));
+        }
         
         io.emit('dashboard_refresh'); 
         res.json({ message: 'Status updated' });
