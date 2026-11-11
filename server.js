@@ -1192,6 +1192,31 @@ app.post('/api/admin/branches', authenticateToken, verifyAdminOrStaff, async (re
     } catch (error) { res.status(500).json({ error: 'Failed to add branch' }); }
 });
 
+app.put('/api/admin/branches/:id', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    const id = Number(req.params.id);
+    const name = String(req.body?.name || '').trim();
+    const code = String(req.body?.code || '').trim();
+    const address = String(req.body?.address || '').trim();
+    const phone = String(req.body?.phone || '').trim();
+    if (!Number.isInteger(id) || id < 1 || !name || !code) {
+        return res.status(400).json({ error: 'Enter a branch name and code.' });
+    }
+
+    try {
+        const [existingBranches] = await pool.execute('SELECT id FROM branches WHERE id = ?', [id]);
+        if (!existingBranches.length) return res.status(404).json({ error: 'Branch not found.' });
+        await pool.execute(
+            'UPDATE branches SET name = ?, code = ?, address = ?, phone = ? WHERE id = ?',
+            [name, code, address, phone || null, id]
+        );
+        await logActivity(req.user.id, `Updated branch details: ${name} (ID: ${id})`);
+        res.json({ message: 'Branch details updated.' });
+    } catch (error) {
+        console.error('Failed to update branch details:', error.message);
+        res.status(500).json({ error: 'Failed to update branch details.' });
+    }
+});
+
 app.put('/api/admin/branches/:id/status', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         await pool.execute('UPDATE branches SET is_active = ? WHERE id = ?', [req.body.is_active, req.params.id]);
