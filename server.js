@@ -175,11 +175,11 @@ const makeOrderEmailLinksHtml = links => `<div style="margin:24px auto 0;max-wid
 const formatOrderItemsText = items => items.map(item => `${item.qty}x ${item.name} — PHP ${(Number(item.price) * Number(item.qty)).toFixed(2)}`).join('\n');
 const formatOrderItemsHtml = items => items.map(item => `<li>${escapeHtml(item.qty)}x ${escapeHtml(item.name)} — PHP ${(Number(item.price) * Number(item.qty)).toFixed(2)}</li>`).join('');
 
-const sendOnlineOrderEmails = async ({ orderId, userId, orderType, branch, address, phone, notes, totalAmount, paymentMethod, items }) => {
+const sendOnlineOrderEmails = async ({ orderId, orderNumber: providedOrderNumber, userId, orderType, branch, address, phone, notes, totalAmount, paymentMethod, items }) => {
     const [customers] = await pool.execute('SELECT firstname, lastname, email FROM users WHERE id = ? LIMIT 1', [userId]);
     const customer = customers[0];
     if (!customer || customer.email === 'guest@3kkitchen.local') return;
-    const orderNumber = `O-${String(orderId).padStart(4, '0')}`;
+    const orderNumber = providedOrderNumber || `O-${String(orderId).padStart(4, '0')}`;
     const links = getOrderEmailLinks();
     const lines = formatOrderItemsText(items);
     const details = `Order ${orderNumber}\nCustomer: ${customer.firstname} ${customer.lastname}\nType: ${orderType}\nBranch: ${branch || 'Not specified'}\nDelivery address: ${address || 'Not provided'}\nContact number: ${phone || 'Not provided'}\nPayment: ${paymentMethod || 'Not specified'}\nTotal: PHP ${Number(totalAmount).toFixed(2)}${notes ? `\nOrder notes: ${notes}` : ''}\n\n${lines}`;
@@ -201,14 +201,14 @@ const sendOnlineOrderEmails = async ({ orderId, userId, orderType, branch, addre
 };
 
 const sendOnlineOrderStatusEmail = async ({ orderId, status }) => {
-    const [rows] = await pool.execute(`SELECT o.id, o.order_type, o.branch, o.delivery_address, o.contact_number,
+    const [rows] = await pool.execute(`SELECT o.id, o.order_number, o.order_type, o.branch, o.delivery_address, o.contact_number,
         o.notes, o.payment_method, o.total_amount,
         u.firstname, u.lastname, u.email
         FROM orders o JOIN users u ON u.id = o.user_id WHERE o.id = ? LIMIT 1`, [orderId]);
     const order = rows[0];
     if (!order || order.email === 'guest@3kkitchen.local' || !['Delivery', 'Pick-up'].includes(order.order_type)) return;
 
-    const orderNumber = `O-${String(order.id).padStart(4, '0')}`;
+    const orderNumber = order.order_number || `O-${String(order.id).padStart(4, '0')}`;
     const completed = status === 'Completed';
     const heading = completed ? 'Your order is complete' : 'We could not complete your order';
     const message = completed
@@ -286,6 +286,7 @@ const initializeDB = async () => {
         'ALTER TABLE users ADD COLUMN password_reset_expires_at DATETIME DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN customer_name VARCHAR(255) DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN order_number VARCHAR(20) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN gcash_reference VARCHAR(13) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN cash_tendered DECIMAL(10,2) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN change_given DECIMAL(10,2) DEFAULT NULL'
@@ -297,6 +298,17 @@ const initializeDB = async () => {
         } catch (e) {
             // Ignore error if this specific column already exists
         }
+    }
+
+    try {
+        await pool.execute(`CREATE TABLE IF NOT EXISTS order_number_sequences (
+            id TINYINT UNSIGNED PRIMARY KEY,
+            last_number INT UNSIGNED NOT NULL DEFAULT 0
+        )`);
+        await pool.execute('INSERT IGNORE INTO order_number_sequences (id, last_number) VALUES (1, 0)');
+        await pool.execute('CREATE UNIQUE INDEX uq_orders_order_number ON orders (order_number)');
+    } catch (error) {
+        if (error.code !== 'ER_DUP_KEYNAME') console.error('Failed to initialize order number sequence:', error.message);
     }
 
     for (const column of ['payment_method', 'order_type']) {
@@ -1060,11 +1072,15 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
 
         connection = await pool.getConnection();
         await connection.beginTransaction();
+        await connection.execute('INSERT IGNORE INTO order_number_sequences (id, last_number) VALUES (1, 0)');
+        const [sequenceRows] = await connection.execute('SELECT last_number FROM order_number_sequences WHERE id = 1 FOR UPDATE');
+        const nextOrderSequence = Number(sequenceRows[0]?.last_number || 0) + 1;
+        const orderNumber = `O-${String(nextOrderSequence).padStart(4, '0')}`;
+        await connection.execute('UPDATE order_number_sequences SET last_number = ? WHERE id = 1', [nextOrderSequence]);
         const [orderResult] = await connection.execute(
-            `INSERT INTO orders (user_id, total_amount, order_type, branch, delivery_address, contact_number, payment_method, gcash_receipt_url, notes, customer_name, gcash_reference, cash_tendered, change_given) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [req.user.id, totalAmount, orderType, branch, address || null, phone || null, paymentMethod, receipt_url || null, notes || null, callingName, isCounterSale && paymentMethod === 'GCash' ? gcashReference : null, tenderedAmount, changeAmount]
+            `INSERT INTO orders (order_number, user_id, total_amount, order_type, branch, delivery_address, contact_number, payment_method, gcash_receipt_url, notes, customer_name, gcash_reference, cash_tendered, change_given) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [orderNumber, req.user.id, totalAmount, orderType, branch, address || null, phone || null, paymentMethod, receipt_url || null, notes || null, callingName, isCounterSale && paymentMethod === 'GCash' ? gcashReference : null, tenderedAmount, changeAmount]
         );
-        const orderNumber = `O-${String(orderResult.insertId).padStart(4, '0')}`;
         if (isKioskCounterSale && !String(customerName || '').trim()) {
             await connection.execute('UPDATE orders SET customer_name = ? WHERE id = ?', [orderNumber, orderResult.insertId]);
         }
@@ -1079,6 +1095,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         if (['Delivery', 'Pick-up'].includes(orderType)) {
             sendOnlineOrderEmails({
                 orderId: orderResult.insertId,
+                orderNumber,
                 userId: req.user.id,
                 orderType,
                 branch,
@@ -1161,7 +1178,7 @@ app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, 
 app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         const nextStatus = String(req.body.status || '');
-        const [existingOrders] = await pool.execute('SELECT id, status, order_type FROM orders WHERE id = ? LIMIT 1', [req.params.id]);
+        const [existingOrders] = await pool.execute('SELECT id, order_number, status, order_type FROM orders WHERE id = ? LIMIT 1', [req.params.id]);
         if (!existingOrders.length) return res.status(404).json({ error: 'Order not found' });
         const existingOrder = existingOrders[0];
         await pool.execute(`UPDATE orders SET status = ?, chat_expires_at = CASE
@@ -1171,7 +1188,7 @@ app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, a
             END
             ELSE NULL
         END WHERE id = ?`, [nextStatus, nextStatus, req.params.id]);
-        await logActivity(req.user.id, `Updated order O-${String(req.params.id).padStart(4, '0')} status to ${nextStatus}`);
+        await logActivity(req.user.id, `Updated order ${existingOrder.order_number || `O-${String(req.params.id).padStart(4, '0')}`} status to ${nextStatus}`);
 
         if (nextStatus !== existingOrder.status && ['Completed', 'Cancelled'].includes(nextStatus) && ['Delivery', 'Pick-up'].includes(existingOrder.order_type)) {
             sendOnlineOrderStatusEmail({ orderId: existingOrder.id, status: nextStatus })
@@ -1186,7 +1203,7 @@ app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, a
 app.put('/api/admin/orders/:id/payment', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         const { paymentMethod, cashTendered, gcashReference } = req.body;
-        const [existingOrders] = await pool.execute('SELECT total_amount FROM orders WHERE id = ?', [req.params.id]);
+        const [existingOrders] = await pool.execute('SELECT total_amount, order_number FROM orders WHERE id = ?', [req.params.id]);
         if (!existingOrders.length) return res.status(404).json({ error: 'Order not found' });
         if (gcashReference != null && !/^\d{13}$/.test(String(gcashReference))) {
             return res.status(400).json({ error: 'GCash reference number must contain exactly 13 digits.' });
@@ -1212,7 +1229,7 @@ app.put('/api/admin/orders/:id/payment', authenticateToken, verifyAdminOrStaff, 
             return res.status(500).json({ error: 'Payment method was not saved' });
         }
 
-        await logActivity(req.user.id, `Processed payment for order O-${String(req.params.id).padStart(4, '0')}`);
+        await logActivity(req.user.id, `Processed payment for order ${existingOrders[0].order_number || `O-${String(req.params.id).padStart(4, '0')}`}`);
         
         io.emit('dashboard_refresh'); 
         res.json({ message: 'Payment method updated' });
