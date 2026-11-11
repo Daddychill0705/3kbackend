@@ -56,9 +56,41 @@ const getBrevoTransport = () => {
 const sendAppEmail = async ({ to, subject, text, html }) => {
     const fromEmail = process.env.BREVO_SENDER_EMAIL;
     if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
+    const fromName = process.env.BREVO_SENDER_NAME || '3K Kitchen';
+    if (process.env.BREVO_API_KEY) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 20000);
+        try {
+            const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+                method: 'POST',
+                headers: {
+                    accept: 'application/json',
+                    'api-key': process.env.BREVO_API_KEY,
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                    sender: { name: fromName, email: fromEmail },
+                    to: (Array.isArray(to) ? to : [to]).map(recipient => typeof recipient === 'string' ? { email: recipient } : recipient),
+                    subject,
+                    textContent: text,
+                    htmlContent: html
+                }),
+                signal: controller.signal
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const reason = result.message || result.code || `HTTP ${response.status}`;
+                throw new Error(`Brevo API send failed: ${reason}`);
+            }
+            return result;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
     const transporter = getBrevoTransport();
     return transporter.sendMail({
-        from: { name: process.env.BREVO_SENDER_NAME || '3K Kitchen', address: fromEmail },
+        from: { name: fromName, address: fromEmail },
         to,
         subject,
         text,
@@ -153,12 +185,7 @@ const sendOnlineOrderEmails = async ({ orderId, userId, orderType, branch, total
 };
 
 const sendPasswordResetEmail = async (email, resetUrl) => {
-    const transporter = getBrevoTransport();
-    const fromEmail = process.env.BREVO_SENDER_EMAIL;
-    if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
-    const fromName = process.env.BREVO_SENDER_NAME || '3K Kitchen';
-    await transporter.sendMail({
-        from: { name: fromName, address: fromEmail },
+    await sendAppEmail({
         to: email,
         subject: 'Reset your 3K Kitchen password',
         text: `We received a request to reset your 3K Kitchen password. Open this link within 30 minutes to choose a new password: ${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
@@ -167,13 +194,8 @@ const sendPasswordResetEmail = async (email, resetUrl) => {
 };
 
 const sendRecoveryDeniedEmail = async (email, note = '') => {
-    const transporter = getBrevoTransport();
-    const fromEmail = process.env.BREVO_SENDER_EMAIL;
-    if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
-    const fromName = process.env.BREVO_SENDER_NAME || '3K Kitchen';
     const decisionText = `Your 3K Kitchen account recovery request was denied.${note ? ` Admin note: ${note}` : ''}`;
-    await transporter.sendMail({
-        from: { name: fromName, address: fromEmail },
+    await sendAppEmail({
         to: email,
         subject: '3K Kitchen account recovery update',
         text: `${decisionText}\n\nIf you did not submit this request, contact 3K Kitchen support.`
@@ -181,11 +203,7 @@ const sendRecoveryDeniedEmail = async (email, note = '') => {
 };
 
 const sendRecoveryApprovedEmail = async (email, resetUrl) => {
-    const transporter = getBrevoTransport();
-    const fromEmail = process.env.BREVO_SENDER_EMAIL;
-    if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
-    await transporter.sendMail({
-        from: { name: process.env.BREVO_SENDER_NAME || '3K Kitchen', address: fromEmail },
+    await sendAppEmail({
         to: email,
         subject: '3K Kitchen account recovery approved',
         text: `Your account recovery was approved. Use this link within 30 minutes to set a new password: ${resetUrl}\n\nIf you did not submit this request, contact 3K Kitchen support.`,
@@ -584,7 +602,7 @@ app.post('/api/forgot-password', async (req, res) => {
     }
 
     try {
-        getBrevoTransport();
+        if (!process.env.BREVO_API_KEY) getBrevoTransport();
         if (!process.env.BREVO_SENDER_EMAIL) throw new Error('BREVO_SENDER_EMAIL is not configured.');
     } catch (error) {
         console.error('Brevo SMTP is not configured:', error.message);
