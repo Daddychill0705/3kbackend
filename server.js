@@ -293,6 +293,21 @@ const initializeDB = async () => {
         await pool.execute('ALTER TABLE email_otp_challenges ADD COLUMN reset_token_hash CHAR(64) DEFAULT NULL');
     } catch (_) { /* Column already exists. */ }
 
+    try {
+        await pool.execute(`CREATE TABLE IF NOT EXISTS menu_categories (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(120) NOT NULL UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        const defaultCategories = ['3k Ala-Carte', '3k Originals', '3k Specials', '3k Budget Meals', 'Rice and Extras', '3k Sets/Extras'];
+        for (const name of defaultCategories) {
+            await pool.execute('INSERT IGNORE INTO menu_categories (name) VALUES (?)', [name]);
+        }
+        await pool.execute(`INSERT IGNORE INTO menu_categories (name)
+            SELECT DISTINCT TRIM(category) FROM menu_items
+            WHERE category IS NOT NULL AND TRIM(category) <> ''`);
+    } catch (error) { console.error('Failed to prepare menu categories:', error.message); }
+
     const requestedBranches = [
         { name: 'Dasma Langkaan Branch', code: 'DASMA-LANGKAAN', address: '0680 ME Juanito R. Remulla Sr. Road, Langkaan I, Dasmariñas, Cavite', aliases: ['dasma langkaan', 'langkaan'] },
         { name: 'Gentry Branch', code: 'GENTRY', address: 'Mel-Gus Bldg, Juanito R. Remulla Senior Rd, General Trias, 4107 Cavite', aliases: ['gentry', 'general trias'] },
@@ -1111,6 +1126,16 @@ app.put('/api/admin/orders/:id/payment', authenticateToken, verifyAdminOrStaff, 
     }
 });
 
+app.get('/api/menu/categories', async (req, res) => {
+    try {
+        const [categories] = await pool.execute('SELECT id, name FROM menu_categories ORDER BY name');
+        res.json(categories);
+    } catch (error) {
+        console.error('Failed to fetch menu categories:', error.message);
+        res.status(500).json({ error: 'Failed to fetch menu categories.' });
+    }
+});
+
 app.get('/api/menu', async (req, res) => {
     try {
         const [items] = await pool.execute('SELECT * FROM menu_items ORDER BY category, name');
@@ -1138,6 +1163,21 @@ app.get('/api/menu/best-sellers', async (req, res) => {
     } catch (error) {
         console.error('Failed to fetch menu best sellers', error);
         res.status(500).json({ error: 'Failed to fetch best sellers' });
+    }
+});
+
+app.post('/api/admin/menu/categories', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    const name = String(req.body?.name || '').trim().replace(/\s+/g, ' ');
+    if (!name || name.length > 120) return res.status(400).json({ error: 'Category name must be between 1 and 120 characters.' });
+    try {
+        const [result] = await pool.execute('INSERT INTO menu_categories (name) VALUES (?)', [name]);
+        await logActivity(req.user.id, `Added menu category: ${name}`);
+        io.emit('dashboard_refresh');
+        res.status(201).json({ id: result.insertId, name });
+    } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'That category already exists.' });
+        console.error('Failed to add menu category:', error.message);
+        res.status(500).json({ error: 'Failed to add menu category.' });
     }
 });
 
