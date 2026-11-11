@@ -299,10 +299,6 @@ const initializeDB = async () => {
             name VARCHAR(120) NOT NULL UNIQUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
-        const defaultCategories = ['3k Ala-Carte', '3k Originals', '3k Specials', '3k Budget Meals', 'Rice and Extras', '3k Sets/Extras'];
-        for (const name of defaultCategories) {
-            await pool.execute('INSERT IGNORE INTO menu_categories (name) VALUES (?)', [name]);
-        }
         await pool.execute(`INSERT IGNORE INTO menu_categories (name)
             SELECT DISTINCT TRIM(category) FROM menu_items
             WHERE category IS NOT NULL AND TRIM(category) <> ''`);
@@ -1178,6 +1174,51 @@ app.post('/api/admin/menu/categories', authenticateToken, verifyAdminOrStaff, as
         if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'That category already exists.' });
         console.error('Failed to add menu category:', error.message);
         res.status(500).json({ error: 'Failed to add menu category.' });
+    }
+});
+
+app.delete('/api/admin/menu/categories', authenticateToken, verifyAdminOrStaff, async (req, res) => {
+    const name = String(req.body?.name || '').trim();
+    const moveTo = String(req.body?.moveTo || '').trim();
+    if (!name) return res.status(400).json({ error: 'Choose a category to delete.' });
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [categories] = await connection.execute('SELECT id, name FROM menu_categories WHERE name = ? LIMIT 1 FOR UPDATE', [name]);
+        if (!categories.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Category not found.' });
+        }
+
+        const [products] = await connection.execute('SELECT COUNT(*) AS count FROM menu_items WHERE category = ?', [name]);
+        const productCount = Number(products[0]?.count || 0);
+        if (productCount > 0 && (!moveTo || moveTo === name)) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'Choose another category to move the products into before deleting this category.' });
+        }
+        if (productCount > 0) {
+            const [targetCategories] = await connection.execute('SELECT id FROM menu_categories WHERE name = ? LIMIT 1', [moveTo]);
+            if (!targetCategories.length) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'The destination category is not available.' });
+            }
+            await connection.execute('UPDATE menu_items SET category = ? WHERE category = ?', [moveTo, name]);
+        }
+
+        await connection.execute('DELETE FROM menu_categories WHERE id = ?', [categories[0].id]);
+        await connection.commit();
+        await logActivity(req.user.id, `Deleted menu category: ${name}${productCount > 0 ? ` and moved ${productCount} product${productCount === 1 ? '' : 's'} to ${moveTo}` : ''}`);
+        io.emit('dashboard_refresh');
+        res.json({ message: 'Category deleted.', movedProducts: productCount, movedTo: productCount > 0 ? moveTo : null });
+    } catch (error) {
+        if (connection) {
+            try { await connection.rollback(); } catch (_) { /* The transaction may already be closed. */ }
+        }
+        console.error('Failed to delete menu category:', error.message);
+        res.status(500).json({ error: 'Failed to delete menu category.' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
