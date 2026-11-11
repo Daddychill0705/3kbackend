@@ -280,6 +280,8 @@ const initializeDB = async () => {
         'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL',
         'ALTER TABLE branches ADD COLUMN address TEXT DEFAULT NULL',
         'ALTER TABLE branches ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
+        "ALTER TABLE branches ADD COLUMN opening_time TIME NOT NULL DEFAULT '08:00:00'",
+        "ALTER TABLE branches ADD COLUMN closing_time TIME NOT NULL DEFAULT '20:00:00'",
         'ALTER TABLE users ADD COLUMN password_reset_token_hash CHAR(64) DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN password_reset_expires_at DATETIME DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL',
@@ -1377,16 +1379,25 @@ app.put('/api/admin/branches/:id', authenticateToken, verifyAdminOrStaff, async 
     const code = String(req.body?.code || '').trim();
     const address = String(req.body?.address || '').trim();
     const phone = String(req.body?.phone || '').trim();
+    const openingTime = req.body?.opening_time == null ? null : String(req.body.opening_time).trim();
+    const closingTime = req.body?.closing_time == null ? null : String(req.body.closing_time).trim();
+    const validTime = value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
     if (!Number.isInteger(id) || id < 1 || !name || !code) {
         return res.status(400).json({ error: 'Enter a branch name and code.' });
     }
+    if ((openingTime !== null && !validTime(openingTime)) || (closingTime !== null && !validTime(closingTime))) {
+        return res.status(400).json({ error: 'Enter valid opening and closing times.' });
+    }
 
     try {
-        const [existingBranches] = await pool.execute('SELECT id FROM branches WHERE id = ?', [id]);
+        const [existingBranches] = await pool.execute('SELECT id, opening_time, closing_time FROM branches WHERE id = ?', [id]);
         if (!existingBranches.length) return res.status(404).json({ error: 'Branch not found.' });
+        const existing = existingBranches[0];
+        const nextOpeningTime = openingTime || String(existing.opening_time || '08:00:00').slice(0, 5);
+        const nextClosingTime = closingTime || String(existing.closing_time || '20:00:00').slice(0, 5);
         await pool.execute(
-            'UPDATE branches SET name = ?, code = ?, address = ?, phone = ? WHERE id = ?',
-            [name, code, address, phone || null, id]
+            'UPDATE branches SET name = ?, code = ?, address = ?, phone = ?, opening_time = ?, closing_time = ? WHERE id = ?',
+            [name, code, address, phone || null, nextOpeningTime, nextClosingTime, id]
         );
         await logActivity(req.user.id, `Updated branch details: ${name} (ID: ${id})`);
         res.json({ message: 'Branch details updated.' });
