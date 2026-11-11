@@ -292,6 +292,41 @@ const initializeDB = async () => {
     try {
         await pool.execute('ALTER TABLE email_otp_challenges ADD COLUMN reset_token_hash CHAR(64) DEFAULT NULL');
     } catch (_) { /* Column already exists. */ }
+
+    const requestedBranches = [
+        { name: 'Dasma Langkaan Branch', code: 'DASMA-LANGKAAN', address: '0680 ME Juanito R. Remulla Sr. Road, Langkaan I, Dasmariñas, Cavite', aliases: ['dasma langkaan', 'langkaan'] },
+        { name: 'Gentry Branch', code: 'GENTRY', address: 'Mel-Gus Bldg, Juanito R. Remulla Senior Rd, General Trias, 4107 Cavite', aliases: ['gentry', 'general trias'] },
+        { name: 'Trece Martires Branch', code: 'TRECE-MARTIRES', address: '7VGC+M5P, Trece Martires City, Cavite', aliases: ['trece martires', 'trece'] },
+        { name: 'Imus Branch', code: 'IMUS', address: 'Plaza Homes Subdivision, Imus, Cavite', aliases: ['imus'] },
+        { name: 'Dasma Bayan Branch', code: 'DASMA-BAYAN', address: '79 Don Placido Campos Avenue, San Agustin III, Dasmariñas, 4114 Cavite', aliases: ['dasma bayan'] }
+    ];
+    try {
+        const [existingBranches] = await pool.execute('SELECT id, name, code FROM branches');
+        const normalizeBranchName = value => String(value || '').toLowerCase().replace(/\b(branch|br)\b/g, '').replace(/[^a-z0-9]/g, '');
+        for (const requested of requestedBranches) {
+            const match = existingBranches.find(branch => requested.aliases.some(alias => {
+                const aliasKey = normalizeBranchName(alias);
+                return normalizeBranchName(branch.name).includes(aliasKey);
+            }));
+            if (match) {
+                // Preserve the existing branch name/code/status and update only its address.
+                await pool.execute('UPDATE branches SET address = ? WHERE id = ?', [requested.address, match.id]);
+                continue;
+            }
+            let code = requested.code;
+            let suffix = 2;
+            while (existingBranches.some(branch => String(branch.code || '').toLowerCase() === code.toLowerCase())) {
+                code = `${requested.code}-${suffix++}`;
+            }
+            const [inserted] = await pool.execute(
+                'INSERT INTO branches (name, code, address, phone) VALUES (?, ?, ?, NULL)',
+                [requested.name, code, requested.address]
+            );
+            existingBranches.push({ id: inserted.insertId, name: requested.name, code });
+        }
+    } catch (error) {
+        console.error('Failed to update requested branch addresses:', error.message);
+    }
 };
 const databaseReady = initializeDB();
 
