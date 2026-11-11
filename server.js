@@ -53,7 +53,7 @@ const getBrevoTransport = () => {
     });
 };
 
-const sendAppEmail = async ({ to, subject, text, html }) => {
+const sendAppEmail = async ({ to, subject, text, html, replyTo }) => {
     const fromEmail = process.env.BREVO_SENDER_EMAIL;
     if (!fromEmail) throw new Error('BREVO_SENDER_EMAIL is not configured.');
     const fromName = process.env.BREVO_SENDER_NAME || '3K Kitchen';
@@ -72,6 +72,7 @@ const sendAppEmail = async ({ to, subject, text, html }) => {
                     sender: { name: fromName, email: fromEmail },
                     to: (Array.isArray(to) ? to : [to]).map(recipient => typeof recipient === 'string' ? { email: recipient } : recipient),
                     subject,
+                    ...(replyTo ? { replyTo: { email: replyTo } } : {}),
                     textContent: text,
                     htmlContent: html
                 }),
@@ -93,6 +94,7 @@ const sendAppEmail = async ({ to, subject, text, html }) => {
         from: { name: fromName, address: fromEmail },
         to,
         subject,
+        ...(replyTo ? { replyTo } : {}),
         text,
         html
     });
@@ -479,6 +481,65 @@ const verifyCurrentAdminPassword = async (userId, password) => {
     const [admins] = await pool.execute('SELECT password, role FROM users WHERE id = ?', [userId]);
     return admins[0]?.role === 'admin' && bcrypt.compare(password, admins[0].password);
 };
+
+app.post('/api/contact', authenticateToken, async (req, res) => {
+    const subject = typeof req.body?.subject === 'string' ? req.body.subject.trim() : '';
+    const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    if (!subject || subject.length > 150) {
+        return res.status(400).json({ error: 'Enter a subject of 1 to 150 characters.' });
+    }
+    if (!message || message.length > 5000) {
+        return res.status(400).json({ error: 'Enter a message of 1 to 5,000 characters.' });
+    }
+
+    try {
+        await databaseReady;
+        const [users] = await pool.execute(
+            'SELECT id, firstname, lastname, email, role FROM users WHERE id = ? LIMIT 1',
+            [req.user.id]
+        );
+        const sender = users[0];
+        if (!sender || sender.email?.toLowerCase() === 'guest@3kkitchen.local' || !['customer', 'admin', 'cashier', 'rider'].includes(sender.role)) {
+            return res.status(403).json({ error: 'Sign in with a registered account to contact us.' });
+        }
+
+        const [adminRows] = await pool.execute(
+            'SELECT email FROM users WHERE role = "admin" AND email IS NOT NULL AND email <> ""'
+        );
+        const adminEmails = [...new Set(adminRows.map(row => String(row.email).trim()).filter(Boolean))];
+        if (!adminEmails.length) {
+            console.error('Contact message could not be delivered: no admin email addresses are configured.');
+            return res.status(503).json({ error: 'We could not reach the support team right now. Please try again later.' });
+        }
+
+        const senderName = `${sender.firstname || ''} ${sender.lastname || ''}`.trim() || sender.email;
+        const submittedAt = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila' });
+        const safeName = escapeHtml(senderName);
+        const safeEmail = escapeHtml(sender.email);
+        const safeSubject = escapeHtml(subject);
+        const safeMessage = escapeHtml(message).replace(/\r?\n/g, '<br>');
+        const safeSubmittedAt = escapeHtml(submittedAt);
+
+        const adminEmailsSent = adminEmails.map(to => sendAppEmail({
+            to,
+            replyTo: sender.email,
+            subject: `Contact Us: ${subject}`,
+            text: `A customer sent a message through the 3K Kitchen website.\n\nFrom: ${senderName} <${sender.email}>\nSubject: ${subject}\nSubmitted: ${submittedAt}\n\n${message}`,
+            html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;color:#33251b"><h1>New Contact Us message</h1><p><b>From:</b> ${safeName} &lt;${safeEmail}&gt;<br><b>Subject:</b> ${safeSubject}<br><b>Submitted:</b> ${safeSubmittedAt}</p><div style="padding:16px;background:#f8f4ed;border-radius:8px;line-height:1.6">${safeMessage}</div><p>You can reply directly to this email to respond to the customer.</p></div>`
+        }));
+        const confirmationEmail = sendAppEmail({
+            to: sender.email,
+            subject: 'We received your message | 3K Kitchen',
+            text: `Hi ${senderName},\n\nWe received your message and our team will get back to you.\n\nSubject: ${subject}\n\nYour message:\n${message}\n\nThank you for contacting 3K Kitchen.`,
+            html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;color:#33251b"><h1>We received your message</h1><p>Hi ${safeName},</p><p>Our team has received your message and will get back to you.</p><p><b>Subject:</b> ${safeSubject}</p><div style="padding:16px;background:#f8f4ed;border-radius:8px;line-height:1.6">${safeMessage}</div><p>Thank you for contacting 3K Kitchen.</p></div>`
+        });
+        await Promise.all([...adminEmailsSent, confirmationEmail]);
+        return res.json({ message: 'Your message was sent. A confirmation email is on its way.' });
+    } catch (error) {
+        console.error('Contact message delivery failed:', error.message);
+        return res.status(503).json({ error: 'We could not send your message right now. Please try again later.' });
+    }
+});
 
 app.get('/', (req, res) => res.send('3K Kitchen API is running successfully!'));
 
