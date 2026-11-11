@@ -1000,12 +1000,16 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
             `INSERT INTO orders (user_id, total_amount, order_type, branch, delivery_address, contact_number, payment_method, gcash_receipt_url, notes, customer_name, gcash_reference, cash_tendered, change_given) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [req.user.id, totalAmount, orderType, branch, address || null, phone || null, paymentMethod, receipt_url || null, notes || null, callingName, isCounterSale && paymentMethod === 'GCash' ? gcashReference : null, tenderedAmount, changeAmount]
         );
+        const orderNumber = `O-${String(orderResult.insertId).padStart(4, '0')}`;
+        if (isKioskCounterSale && !String(customerName || '').trim()) {
+            await connection.execute('UPDATE orders SET customer_name = ? WHERE id = ?', [orderNumber, orderResult.insertId]);
+        }
         for (const item of parsedItems) {
             await connection.execute('INSERT INTO order_items (order_id, item_name, quantity, price) VALUES (?, ?, ?, ?)', [orderResult.insertId, item.name, item.qty, parseFloat(item.price)]);
         }
         await connection.commit();
         
-        await logActivity(req.user.id, `Placed new order O-${String(orderResult.insertId).padStart(4, '0')}`);
+        await logActivity(req.user.id, `Placed new order ${orderNumber}`);
 
         if (['Delivery', 'Pick-up'].includes(orderType)) {
             sendOnlineOrderEmails({
@@ -1020,7 +1024,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         }
         
         io.emit('dashboard_refresh'); 
-        res.status(201).json({ message: 'Order placed', orderId: orderResult.insertId });
+        res.status(201).json({ message: 'Order placed', orderId: orderResult.insertId, orderNumber });
     } catch (error) {
         if (connection) {
             try { await connection.rollback(); } catch (rollbackError) {
