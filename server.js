@@ -280,6 +280,7 @@ const initializeDB = async () => {
             email VARCHAR(255) NOT NULL,
             purpose VARCHAR(32) NOT NULL,
             code_hash CHAR(64) NOT NULL,
+            reset_token_hash CHAR(64) DEFAULT NULL,
             payload TEXT DEFAULT NULL,
             attempts INT NOT NULL DEFAULT 0,
             expires_at DATETIME NOT NULL,
@@ -288,6 +289,9 @@ const initializeDB = async () => {
             INDEX idx_email_otp_email_purpose (email, purpose, created_at)
         )`);
     } catch (e) { console.error('Failed to create email_otp_challenges table', e); }
+    try {
+        await pool.execute('ALTER TABLE email_otp_challenges ADD COLUMN reset_token_hash CHAR(64) DEFAULT NULL');
+    } catch (_) { /* Column already exists. */ }
 };
 const databaseReady = initializeDB();
 
@@ -557,10 +561,7 @@ app.post('/api/forgot-password/request-otp', async (req, res) => {
 app.post('/api/forgot-password/verify-otp', async (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const otp = String(req.body?.otp || '').trim();
-    const password = req.body?.password;
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp) || typeof password !== 'string' || password.length < 8 || password.length > 128) {
-        return res.status(400).json({ error: 'Enter a valid email, 6-digit code, and password of at least 8 characters.' });
-    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) return res.status(400).json({ error: 'Enter a valid email and 6-digit verification code.' });
     let connection;
     try {
         connection = await pool.getConnection();
@@ -576,19 +577,59 @@ app.post('/api/forgot-password/verify-otp', async (req, res) => {
             await connection.commit();
             return res.status(400).json({ error: 'The verification code is incorrect.' });
         }
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const [result] = await connection.execute('UPDATE users SET password = ?, password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE email = ?', [hashedPassword, email]);
-        if (!result.affectedRows) {
-            await connection.rollback();
-            return res.status(400).json({ error: 'The verification code is invalid or expired. Request a new code.' });
-        }
-        await connection.execute('UPDATE email_otp_challenges SET consumed_at = NOW() WHERE id = ?', [challenge.id]);
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+        await connection.execute(
+            'UPDATE email_otp_challenges SET reset_token_hash = ?, expires_at = DATE_ADD(NOW(), INTERVAL 10 MINUTE) WHERE id = ?',
+            [resetTokenHash, challenge.id]
+        );
         await connection.commit();
-        sendAppEmail({ to: email, subject: 'Your 3K Kitchen password was changed', text: 'The password for your 3K Kitchen account was changed. If you did not make this change, contact an administrator.', html: '<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Password changed</h1><p>The password for your 3K Kitchen account was changed.</p><p>If you did not make this change, contact an administrator.</p></div>' }).catch(mailError => console.error('Password change notice email failed:', mailError.message));
-        return res.json({ message: 'Password reset successfully. You can now sign in.' });
+        return res.json({ message: 'Email verified. Choose a new password to finish resetting your account.', resetToken });
     } catch (error) {
         if (connection) try { await connection.rollback(); } catch (_) {}
         console.error('Password reset OTP verification failed:', error.message);
+        return res.status(500).json({ error: 'Could not reset the password. Please try again.' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.post('/api/forgot-password/reset-with-token', async (req, res) => {
+    const resetToken = String(req.body?.resetToken || '');
+    const password = req.body?.password;
+    if (!/^[a-f0-9]{64}$/i.test(resetToken) || typeof password !== 'string' || password.length < 8 || password.length > 128) {
+        return res.status(400).json({ error: 'Enter a valid reset session and password of at least 8 characters.' });
+    }
+    let connection;
+    try {
+        const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+        const hashedPassword = await bcrypt.hash(password, 10);
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [challenges] = await connection.execute(
+            'SELECT id, email FROM email_otp_challenges WHERE purpose = "reset" AND reset_token_hash = ? AND consumed_at IS NULL AND expires_at > NOW() ORDER BY id DESC LIMIT 1 FOR UPDATE',
+            [resetTokenHash]
+        );
+        const challenge = challenges[0];
+        if (!challenge) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'Your verification session expired. Request a new code.' });
+        }
+        const [updatedUser] = await connection.execute(
+            'UPDATE users SET password = ?, password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE email = ?',
+            [hashedPassword, challenge.email]
+        );
+        if (!updatedUser.affectedRows) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'Your verification session expired. Request a new code.' });
+        }
+        await connection.execute('UPDATE email_otp_challenges SET consumed_at = NOW(), reset_token_hash = NULL WHERE id = ?', [challenge.id]);
+        await connection.commit();
+        sendAppEmail({ to: challenge.email, subject: 'Your 3K Kitchen password was changed', text: 'The password for your 3K Kitchen account was changed. If you did not make this change, contact an administrator.', html: '<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#33251b"><h1>Password changed</h1><p>The password for your 3K Kitchen account was changed.</p><p>If you did not make this change, contact an administrator.</p></div>' }).catch(mailError => console.error('Password change notice email failed:', mailError.message));
+        return res.json({ message: 'Password reset successfully. You can now sign in.' });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Password reset completion failed:', error.message);
         return res.status(500).json({ error: 'Could not reset the password. Please try again.' });
     } finally {
         if (connection) connection.release();
