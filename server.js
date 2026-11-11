@@ -217,6 +217,8 @@ const initializeDB = async () => {
         'ALTER TABLE users ADD COLUMN dob DATE DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN last_updated DATETIME DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL',
+        'ALTER TABLE branches ADD COLUMN address TEXT DEFAULT NULL',
+        'ALTER TABLE branches ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN password_reset_token_hash CHAR(64) DEFAULT NULL',
         'ALTER TABLE users ADD COLUMN password_reset_expires_at DATETIME DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL',
@@ -1294,6 +1296,7 @@ app.put('/api/admin/branches/:id', authenticateToken, verifyAdminOrStaff, async 
         res.json({ message: 'Branch details updated.' });
     } catch (error) {
         console.error('Failed to update branch details:', error.message);
+        if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'That branch code is already in use. Choose a different code.' });
         res.status(500).json({ error: 'Failed to update branch details.' });
     }
 });
