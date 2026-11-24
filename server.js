@@ -466,11 +466,21 @@ const getAvailableOnlineRiderIds = async (excludeRiderId = null) => {
     const onlineIds = [...onlineRiderSockets.keys()].filter(id => Number(id) !== Number(excludeRiderId));
     if (!onlineIds.length) return [];
     const placeholders = onlineIds.map(() => '?').join(',');
-    const [busyRiders] = await pool.execute(
+    const [assignedRiders] = await pool.execute(
         `SELECT DISTINCT assigned_rider_id FROM orders WHERE order_type = 'Delivery' AND status = 'Out for Delivery' AND assigned_rider_id IN (${placeholders})`,
         onlineIds
     );
-    const busyIds = new Set(busyRiders.map(row => Number(row.assigned_rider_id)));
+    const [assistingRiders] = await pool.execute(
+        `SELECT DISTINCT a.accepted_by_rider_id FROM rider_assistance_requests a
+         JOIN orders o ON o.id = a.order_id
+         WHERE a.status = 'Accepted' AND o.order_type = 'Delivery' AND o.status = 'Out for Delivery'
+           AND a.accepted_by_rider_id IN (${placeholders})`,
+        onlineIds
+    );
+    const busyIds = new Set([
+        ...assignedRiders.map(row => Number(row.assigned_rider_id)),
+        ...assistingRiders.map(row => Number(row.accepted_by_rider_id))
+    ]);
     return onlineIds.filter(id => !busyIds.has(Number(id)));
 };
 
@@ -1352,12 +1362,32 @@ app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, 
     try {
         const [orders] = await pool.execute(`SELECT o.*, UNIX_TIMESTAMP(o.chat_expires_at) * 1000 AS chat_expires_at_ms,
             u.firstname, u.lastname, u.email FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC`);
+        const assistanceByOrder = new Map();
+        if (req.user.role === 'rider') {
+            const [assistingOrders] = await pool.execute(`SELECT a.order_id, a.requester_rider_id, a.accepted_by_rider_id, a.message,
+                requester.firstname AS requester_firstname, requester.lastname AS requester_lastname,
+                helper.firstname AS helper_firstname, helper.lastname AS helper_lastname
+                FROM rider_assistance_requests a
+                JOIN orders o ON o.id = a.order_id
+                JOIN users requester ON requester.id = a.requester_rider_id
+                JOIN users helper ON helper.id = a.accepted_by_rider_id
+                WHERE (a.accepted_by_rider_id = ? OR a.requester_rider_id = ?) AND a.status = 'Accepted'
+                  AND o.order_type = 'Delivery' AND o.status IN ('Out for Delivery', 'Completed')`, [req.user.id, req.user.id]);
+            assistingOrders.forEach(assistance => assistanceByOrder.set(Number(assistance.order_id), assistance));
+        }
         for (let order of orders) {
             const [items] = await pool.execute("SELECT item_name as name, quantity as qty, price FROM order_items WHERE order_id = ?", [order.id]);
             order.itemsData = items;
             order.items = items.map(i => `${i.qty}x ${i.name}`).join(', ');
             order.date = new Date(order.created_at).toLocaleString();
             order.customerName = `${order.firstname} ${order.lastname}`;
+            const assistance = assistanceByOrder.get(Number(order.id));
+            if (assistance) {
+                order.is_assisting = Number(assistance.accepted_by_rider_id) === Number(req.user.id);
+                order.assisting_for_name = `${assistance.requester_firstname} ${assistance.requester_lastname}`;
+                order.assistance_helper_name = `${assistance.helper_firstname} ${assistance.helper_lastname}`;
+                order.assistance_message = assistance.message;
+            }
         }
         res.json(orders);
     } catch (error) { res.status(500).json({ error: 'Failed to fetch orders' }); }
@@ -1410,7 +1440,15 @@ app.post('/api/rider/orders/:id/claim', authenticateToken, verifyRiderOrAdmin, a
             'SELECT id FROM orders WHERE assigned_rider_id = ? AND order_type = "Delivery" AND status = "Out for Delivery" LIMIT 1 FOR UPDATE',
             [req.user.id]
         );
-        if (activeDeliveries.length) {
+        let activeAssists = [];
+        if (!activeDeliveries.length) {
+            [activeAssists] = await connection.execute(
+                `SELECT a.id FROM rider_assistance_requests a JOIN orders o ON o.id = a.order_id
+                 WHERE a.accepted_by_rider_id = ? AND a.status = "Accepted" AND o.order_type = "Delivery" AND o.status = "Out for Delivery" LIMIT 1`,
+                [req.user.id]
+            );
+        }
+        if (activeDeliveries.length || activeAssists.length) {
             await connection.rollback();
             return res.status(409).json({ error: 'Complete your current delivery and submit its proof photo before claiming another order.' });
         }
@@ -1457,7 +1495,16 @@ app.post('/api/rider/orders/:id/complete', authenticateToken, verifyRiderOrAdmin
         await connection.beginTransaction();
         const [orders] = await connection.execute('SELECT id, order_number, status, order_type, assigned_rider_id FROM orders WHERE id = ? LIMIT 1 FOR UPDATE', [orderId]);
         const order = orders[0];
-        if (!order || order.status !== 'Out for Delivery' || order.order_type !== 'Delivery' || Number(order.assigned_rider_id) !== Number(req.user.id)) {
+        let isAssignedRider = Number(order?.assigned_rider_id) === Number(req.user.id);
+        let isAcceptedHelper = false;
+        if (order && !isAssignedRider) {
+            const [assistance] = await connection.execute(
+                'SELECT id FROM rider_assistance_requests WHERE order_id = ? AND accepted_by_rider_id = ? AND status = "Accepted" LIMIT 1 FOR UPDATE',
+                [orderId, req.user.id]
+            );
+            isAcceptedHelper = assistance.length > 0;
+        }
+        if (!order || order.status !== 'Out for Delivery' || order.order_type !== 'Delivery' || (!isAssignedRider && !isAcceptedHelper)) {
             await connection.rollback();
             return res.status(409).json({ error: 'This delivery is not assigned to you or is no longer active.' });
         }
@@ -1537,6 +1584,14 @@ app.post('/api/rider/assistance', authenticateToken, verifyRiderOnly, async (req
         if (!order || order.order_type !== 'Delivery' || order.status !== 'Out for Delivery' || Number(order.assigned_rider_id) !== Number(req.user.id)) {
             await connection.rollback();
             return res.status(409).json({ error: 'You can only request help for your active delivery.' });
+        }
+        const [acceptedAssistance] = await connection.execute(
+            'SELECT id FROM rider_assistance_requests WHERE order_id = ? AND status = "Accepted" LIMIT 1 FOR UPDATE',
+            [orderId]
+        );
+        if (acceptedAssistance.length) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'Another rider is already assisting with this delivery.' });
         }
         const [pending] = await connection.execute(
             'SELECT id FROM rider_assistance_requests WHERE order_id = ? AND requester_rider_id = ? AND status = "Pending" LIMIT 1 FOR UPDATE',
@@ -1627,7 +1682,15 @@ app.post('/api/rider/assistance/:id/accept', authenticateToken, verifyRiderOnly,
             'SELECT id FROM orders WHERE assigned_rider_id = ? AND order_type = "Delivery" AND status = "Out for Delivery" LIMIT 1 FOR UPDATE',
             [req.user.id]
         );
-        if (activeDeliveries.length) {
+        let activeAssists = [];
+        if (!activeDeliveries.length) {
+            [activeAssists] = await connection.execute(
+                `SELECT a.id FROM rider_assistance_requests a JOIN orders o ON o.id = a.order_id
+                 WHERE a.accepted_by_rider_id = ? AND a.status = "Accepted" AND o.order_type = "Delivery" AND o.status = "Out for Delivery" LIMIT 1`,
+                [req.user.id]
+            );
+        }
+        if (activeDeliveries.length || activeAssists.length) {
             await connection.rollback();
             return res.status(409).json({ error: 'Finish your current delivery before accepting an assistance request.' });
         }
@@ -1656,7 +1719,6 @@ app.post('/api/rider/assistance/:id/accept', authenticateToken, verifyRiderOnly,
         }
         const [helperRows] = await connection.execute('SELECT firstname, lastname FROM users WHERE id = ? LIMIT 1', [req.user.id]);
         const helperName = `${helperRows[0]?.firstname || ''} ${helperRows[0]?.lastname || ''}`.trim();
-        await connection.execute('UPDATE orders SET assigned_rider_id = ? WHERE id = ?', [req.user.id, order.id]);
         await connection.execute(
             'UPDATE rider_assistance_requests SET status = "Accepted", accepted_by_rider_id = ?, accepted_at = CURRENT_TIMESTAMP WHERE id = ?',
             [req.user.id, requestId]
@@ -1677,7 +1739,7 @@ app.post('/api/rider/assistance/:id/accept', authenticateToken, verifyRiderOnly,
         io.to('online_riders').emit('rider_assistance_resolved', { requestId, status: 'Accepted' });
         io.emit('dashboard_refresh');
         await publishRiderAvailability();
-        return res.json({ message: 'Assistance accepted. The delivery is now assigned to you.', orderId: order.id });
+        return res.json({ message: 'Assistance accepted. You are now helping with the delivery.', orderId: order.id });
     } catch (error) {
         if (connection) try { await connection.rollback(); } catch (_) {}
         console.error('Could not accept rider assistance request:', error.message);
