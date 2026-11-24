@@ -290,6 +290,8 @@ const initializeDB = async () => {
         'ALTER TABLE orders ADD COLUMN chat_expires_at DATETIME DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN customer_name VARCHAR(255) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN order_number VARCHAR(20) DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN assigned_rider_id INT DEFAULT NULL',
+        'ALTER TABLE orders ADD COLUMN delivery_proof_url VARCHAR(1000) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN gcash_reference VARCHAR(13) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN cash_tendered DECIMAL(10,2) DEFAULT NULL',
         'ALTER TABLE orders ADD COLUMN change_given DECIMAL(10,2) DEFAULT NULL'
@@ -497,6 +499,11 @@ const verifyAdminOrStaff = (req, res, next) => {
 const verifyAdminOnly = (req, res, next) => {
     if (req.user?.role === 'admin') next();
     else res.status(403).json({ error: 'Administrator access required' });
+};
+
+const verifyRiderOrAdmin = (req, res, next) => {
+    if (req.user && ['rider', 'admin'].includes(req.user.role)) next();
+    else res.status(403).json({ error: 'Rider access required' });
 };
 
 const verifyCurrentAdminPassword = async (userId, password) => {
@@ -1274,6 +1281,7 @@ app.get('/api/admin/orders', authenticateToken, verifyAdminOrStaff, async (req, 
 app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, async (req, res) => {
     try {
         const nextStatus = String(req.body.status || '');
+        if (req.user.role === 'rider') return res.status(403).json({ error: 'Use the delivery claim and proof submission actions to update a delivery.' });
         const [existingOrders] = await pool.execute('SELECT id, order_number, status, order_type FROM orders WHERE id = ? LIMIT 1', [req.params.id]);
         if (!existingOrders.length) return res.status(404).json({ error: 'Order not found' });
         const existingOrder = existingOrders[0];
@@ -1294,6 +1302,90 @@ app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, a
         io.emit('dashboard_refresh'); 
         res.json({ message: 'Status updated' });
     } catch (error) { res.status(500).json({ error: 'Failed to update status' }); }
+});
+
+app.post('/api/rider/orders/:id/claim', authenticateToken, verifyRiderOrAdmin, async (req, res) => {
+    const orderId = Number(req.params.id);
+    if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Invalid order.' });
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [riders] = await connection.execute('SELECT id FROM users WHERE id = ? AND role IN ("rider", "admin") FOR UPDATE', [req.user.id]);
+        if (!riders.length) {
+            await connection.rollback();
+            return res.status(403).json({ error: 'Rider access required.' });
+        }
+        const [activeDeliveries] = await connection.execute(
+            'SELECT id FROM orders WHERE assigned_rider_id = ? AND order_type = "Delivery" AND status = "Out for Delivery" LIMIT 1 FOR UPDATE',
+            [req.user.id]
+        );
+        if (activeDeliveries.length) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'Complete your current delivery and submit its proof photo before claiming another order.' });
+        }
+        const [orders] = await connection.execute('SELECT id, status, order_type, assigned_rider_id FROM orders WHERE id = ? LIMIT 1 FOR UPDATE', [orderId]);
+        const order = orders[0];
+        if (!order || order.status !== 'Ready' || order.order_type !== 'Delivery' || order.assigned_rider_id) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'This delivery is no longer available.' });
+        }
+        await connection.execute(
+            'UPDATE orders SET status = "Out for Delivery", assigned_rider_id = ?, delivery_proof_url = NULL, chat_expires_at = NULL WHERE id = ?',
+            [req.user.id, orderId]
+        );
+        await connection.commit();
+        await logActivity(req.user.id, `Claimed delivery order ${orderId}`);
+        io.emit('dashboard_refresh');
+        return res.json({ message: 'Delivery claimed.' });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Failed to claim delivery:', error.message);
+        return res.status(500).json({ error: 'Could not claim this delivery.' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.post('/api/rider/orders/:id/complete', authenticateToken, verifyRiderOrAdmin, async (req, res) => {
+    const orderId = Number(req.params.id);
+    const proofUrl = String(req.body?.proofUrl || '').trim();
+    if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Invalid order.' });
+    try {
+        const parsedProofUrl = new URL(proofUrl);
+        if (parsedProofUrl.protocol !== 'https:' || parsedProofUrl.hostname !== 'res.cloudinary.com' || !parsedProofUrl.pathname.includes('/image/upload/') || proofUrl.length > 1000) {
+            return res.status(400).json({ error: 'Upload a valid delivery proof photo before completing this delivery.' });
+        }
+    } catch (_) {
+        return res.status(400).json({ error: 'Upload a valid delivery proof photo before completing this delivery.' });
+    }
+
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [orders] = await connection.execute('SELECT id, order_number, status, order_type, assigned_rider_id FROM orders WHERE id = ? LIMIT 1 FOR UPDATE', [orderId]);
+        const order = orders[0];
+        if (!order || order.status !== 'Out for Delivery' || order.order_type !== 'Delivery' || Number(order.assigned_rider_id) !== Number(req.user.id)) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'This delivery is not assigned to you or is no longer active.' });
+        }
+        await connection.execute(
+            'UPDATE orders SET status = "Completed", delivery_proof_url = ?, chat_expires_at = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE) WHERE id = ?',
+            [proofUrl, orderId]
+        );
+        await connection.commit();
+        await logActivity(req.user.id, `Completed delivery order ${order.order_number || orderId} with proof photo`);
+        io.emit('dashboard_refresh');
+        sendOnlineOrderStatusEmail({ orderId, status: 'Completed' }).catch(mailError => console.error('Order status email notification failed:', mailError.message));
+        return res.json({ message: 'Delivery marked as delivered with proof.' });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Failed to complete delivery:', error.message);
+        return res.status(500).json({ error: 'Could not complete this delivery.' });
+    } finally {
+        if (connection) connection.release();
+    }
 });
 
 app.put('/api/admin/orders/:id/payment', authenticateToken, verifyAdminOrStaff, async (req, res) => {
