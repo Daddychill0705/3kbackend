@@ -282,6 +282,7 @@ const initializeDB = async () => {
         'ALTER TABLE users ADD COLUMN branch VARCHAR(255) DEFAULT NULL',
         'ALTER TABLE branches ADD COLUMN address TEXT DEFAULT NULL',
         'ALTER TABLE branches ADD COLUMN phone VARCHAR(50) DEFAULT NULL',
+        'ALTER TABLE branches ADD COLUMN maps_url VARCHAR(1000) DEFAULT NULL',
         "ALTER TABLE branches ADD COLUMN opening_time TIME NOT NULL DEFAULT '08:00:00'",
         "ALTER TABLE branches ADD COLUMN closing_time TIME NOT NULL DEFAULT '20:00:00'",
         'ALTER TABLE users ADD COLUMN password_reset_token_hash CHAR(64) DEFAULT NULL',
@@ -416,6 +417,28 @@ const initializeDB = async () => {
         }
     } catch (error) {
         console.error('Failed to update requested branch addresses:', error.message);
+    }
+
+    const branchMapLocations = [
+        { aliases: ['gma terminal', 'gma'], url: 'https://maps.app.goo.gl/ze9gFhjcZUTn1tJV8' },
+        { aliases: ['dasma langkaan', 'langkaan'], url: 'https://maps.app.goo.gl/vmPZZJem9CC96u1x7' },
+        { aliases: ['silang'], url: 'https://maps.app.goo.gl/1SnpwG2aKL4LfouX9' },
+        { aliases: ['gentri', 'gentry', 'general trias'], url: 'https://maps.app.goo.gl/t7vfZsAebrToyjZf6' },
+        { aliases: ['trece martires', 'trece'], url: 'https://maps.app.goo.gl/KUprPCP86yhGAD6C7' },
+        { aliases: ['dasma bayan'], url: 'https://maps.app.goo.gl/TCabZrM8zpQUvQQ8A' },
+        { aliases: ['imus'], url: 'https://maps.app.goo.gl/24ukxjvzrSZfxGin7' }
+    ];
+    try {
+        const [branches] = await pool.execute('SELECT id, name, maps_url FROM branches');
+        const normalize = value => String(value || '').toLowerCase().replace(/\b(branch|br)\b/g, '').replace(/[^a-z0-9]/g, '');
+        for (const location of branchMapLocations) {
+            const branch = branches.find(candidate => location.aliases.some(alias => normalize(candidate.name).includes(normalize(alias))));
+            if (branch && !branch.maps_url) {
+                await pool.execute('UPDATE branches SET maps_url = ? WHERE id = ?', [location.url, branch.id]);
+            }
+        }
+    } catch (error) {
+        console.error('Failed to set default branch map links:', error.message);
     }
 };
 const databaseReady = initializeDB();
@@ -1469,6 +1492,7 @@ app.put('/api/admin/branches/:id', authenticateToken, verifyAdminOrStaff, async 
     const code = String(req.body?.code || '').trim();
     const address = String(req.body?.address || '').trim();
     const phone = String(req.body?.phone || '').trim();
+    const mapsUrl = String(req.body?.maps_url || '').trim();
     const openingTime = req.body?.opening_time == null ? null : String(req.body.opening_time).trim();
     const closingTime = req.body?.closing_time == null ? null : String(req.body.closing_time).trim();
     const validTime = value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
@@ -1478,6 +1502,15 @@ app.put('/api/admin/branches/:id', authenticateToken, verifyAdminOrStaff, async 
     if ((openingTime !== null && !validTime(openingTime)) || (closingTime !== null && !validTime(closingTime))) {
         return res.status(400).json({ error: 'Enter valid opening and closing times.' });
     }
+    if (mapsUrl) {
+        try {
+            const parsedUrl = new URL(mapsUrl);
+            const allowedHosts = ['maps.app.goo.gl', 'google.com', 'www.google.com', 'maps.google.com'];
+            if (parsedUrl.protocol !== 'https:' || !allowedHosts.includes(parsedUrl.hostname) || mapsUrl.length > 1000) throw new Error('Invalid Google Maps URL');
+        } catch (_) {
+            return res.status(400).json({ error: 'Enter a valid HTTPS Google Maps link.' });
+        }
+    }
 
     try {
         const [existingBranches] = await pool.execute('SELECT id, opening_time, closing_time FROM branches WHERE id = ?', [id]);
@@ -1486,8 +1519,8 @@ app.put('/api/admin/branches/:id', authenticateToken, verifyAdminOrStaff, async 
         const nextOpeningTime = openingTime || String(existing.opening_time || '08:00:00').slice(0, 5);
         const nextClosingTime = closingTime || String(existing.closing_time || '20:00:00').slice(0, 5);
         await pool.execute(
-            'UPDATE branches SET name = ?, code = ?, address = ?, phone = ?, opening_time = ?, closing_time = ? WHERE id = ?',
-            [name, code, address, phone || null, nextOpeningTime, nextClosingTime, id]
+            'UPDATE branches SET name = ?, code = ?, address = ?, phone = ?, maps_url = ?, opening_time = ?, closing_time = ? WHERE id = ?',
+            [name, code, address, phone || null, mapsUrl || null, nextOpeningTime, nextClosingTime, id]
         );
         await logActivity(req.user.id, `Updated branch details: ${name} (ID: ${id})`);
         res.json({ message: 'Branch details updated.' });
