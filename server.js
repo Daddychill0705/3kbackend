@@ -640,9 +640,10 @@ app.post('/api/register/request-otp', async (req, res) => {
     const firstname = String(req.body?.firstname || '').trim();
     const lastname = String(req.body?.lastname || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();
+    const phone = String(req.body?.phone || '').trim();
     const password = req.body?.password;
-    if (!firstname || firstname.length > 100 || !lastname || lastname.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255 || typeof password !== 'string' || password.length < 8 || password.length > 128 || req.body?.termsAccepted !== true) {
-        return res.status(400).json({ error: 'Enter valid account details, use a password of at least 8 characters, and accept the Terms and Privacy Policy.' });
+    if (!firstname || firstname.length > 100 || !lastname || lastname.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255 || !phone || phone.length > 50 || typeof password !== 'string' || password.length < 8 || password.length > 128 || req.body?.termsAccepted !== true) {
+        return res.status(400).json({ error: 'Enter valid account details including a phone number, use a password of at least 8 characters, and accept the Terms and Privacy Policy.' });
     }
     try {
         const [existing] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
@@ -650,7 +651,7 @@ app.post('/api/register/request-otp', async (req, res) => {
         const [recent] = await pool.execute('SELECT id FROM email_otp_challenges WHERE email = ? AND purpose = "register" AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND) LIMIT 1', [email]);
         if (recent.length) return res.status(429).json({ error: 'Please wait one minute before requesting another code.' });
         const hashedPassword = await bcrypt.hash(password, 10);
-        const payload = JSON.stringify({ firstname, lastname, email, password: hashedPassword });
+        const payload = JSON.stringify({ firstname, lastname, email, phone, password: hashedPassword });
         const otp = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
         await pool.execute('UPDATE email_otp_challenges SET consumed_at = NOW() WHERE email = ? AND purpose = "register" AND consumed_at IS NULL', [email]);
         const [inserted] = await pool.execute(
@@ -691,14 +692,18 @@ app.post('/api/register/verify-otp', async (req, res) => {
             return res.status(400).json({ error: 'The verification code is incorrect.' });
         }
         const account = JSON.parse(challenge.payload || '{}');
+        if (typeof account.phone !== 'string' || !account.phone.trim() || account.phone.length > 50) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'This sign-up request is missing a valid phone number. Please register again with your phone number.' });
+        }
         const [existing] = await connection.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
         if (existing.length) {
             await connection.rollback();
             return res.status(409).json({ error: 'An account already uses this email address.' });
         }
         await connection.execute(
-            'INSERT INTO users (firstname, lastname, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, "customer", NULL, NULL, NULL)',
-            [account.firstname, account.lastname, email, account.password]
+            'INSERT INTO users (firstname, lastname, email, password, role, phone, dob, branch) VALUES (?, ?, ?, ?, "customer", ?, NULL, NULL)',
+            [account.firstname, account.lastname, email, account.password, account.phone]
         );
         await connection.execute('UPDATE email_otp_challenges SET consumed_at = NOW() WHERE id = ?', [challenge.id]);
         await connection.commit();
@@ -928,7 +933,7 @@ app.get('/api/admin/account-recovery', authenticateToken, verifyAdminOnly, async
             account.id AS matched_account_id, account.firstname AS matched_firstname, account.lastname AS matched_lastname,
             account.phone AS matched_phone, DATE_FORMAT(account.dob, '%Y-%m-%d') AS matched_dob
             FROM account_recovery_requests r LEFT JOIN users u ON u.id = r.reviewed_by
-            LEFT JOIN users account ON account.email = r.account_email
+            LEFT JOIN users account ON LOWER(TRIM(account.email)) = LOWER(TRIM(r.account_email))
             ORDER BY CASE WHEN r.status = 'Pending' THEN 0 ELSE 1 END, r.created_at DESC`);
         return res.json(requests);
     } catch (error) {
@@ -960,7 +965,7 @@ app.put('/api/admin/account-recovery/:id', authenticateToken, verifyAdminOnly, a
         }
 
         if (decision === 'Approved') {
-            const [accounts] = await connection.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [request.account_email]);
+            const [accounts] = await connection.execute('SELECT id FROM users WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) LIMIT 1', [request.account_email]);
             if (!accounts.length) {
                 await connection.rollback();
                 return res.status(404).json({ error: 'No account matches the submitted account email. Verify the details before approving.' });
