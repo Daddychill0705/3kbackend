@@ -642,8 +642,8 @@ app.post('/api/register/request-otp', async (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const phone = String(req.body?.phone || '').trim();
     const password = req.body?.password;
-    if (!firstname || firstname.length > 100 || !lastname || lastname.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255 || !phone || phone.length > 50 || typeof password !== 'string' || password.length < 8 || password.length > 128 || req.body?.termsAccepted !== true) {
-        return res.status(400).json({ error: 'Enter valid account details including a phone number, use a password of at least 8 characters, and accept the Terms and Privacy Policy.' });
+    if (!firstname || firstname.length > 100 || !lastname || lastname.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255 || !/^09\d{9}$/.test(phone) || typeof password !== 'string' || password.length < 8 || password.length > 128 || req.body?.termsAccepted !== true) {
+        return res.status(400).json({ error: 'Enter a valid 11-digit Philippine mobile number starting with 09, use a password of at least 8 characters, and accept the Terms and Privacy Policy.' });
     }
     try {
         const [existing] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
@@ -692,7 +692,7 @@ app.post('/api/register/verify-otp', async (req, res) => {
             return res.status(400).json({ error: 'The verification code is incorrect.' });
         }
         const account = JSON.parse(challenge.payload || '{}');
-        if (typeof account.phone !== 'string' || !account.phone.trim() || account.phone.length > 50) {
+        if (typeof account.phone !== 'string' || !/^09\d{9}$/.test(account.phone)) {
             await connection.rollback();
             return res.status(400).json({ error: 'This sign-up request is missing a valid phone number. Please register again with your phone number.' });
         }
