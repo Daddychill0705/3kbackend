@@ -338,6 +338,21 @@ const initializeDB = async () => {
     } catch (e) { console.error('Failed to create activity_logs table', e); }
 
     try {
+        await pool.execute(`CREATE TABLE IF NOT EXISTS rider_assistance_requests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            order_id INT NOT NULL,
+            requester_rider_id INT NOT NULL,
+            message VARCHAR(1000) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'Pending',
+            accepted_by_rider_id INT DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            accepted_at DATETIME DEFAULT NULL,
+            INDEX idx_rider_assistance_status_created (status, created_at),
+            INDEX idx_rider_assistance_order (order_id)
+        )`);
+    } catch (e) { console.error('Failed to create rider_assistance_requests table', e); }
+
+    try {
         await pool.execute(`CREATE TABLE IF NOT EXISTS account_recovery_requests (
             id INT AUTO_INCREMENT PRIMARY KEY,
             account_email VARCHAR(255) NOT NULL,
@@ -445,6 +460,52 @@ const initializeDB = async () => {
 };
 const databaseReady = initializeDB();
 
+const onlineRiderSockets = new Map();
+
+const getAvailableOnlineRiderIds = async (excludeRiderId = null) => {
+    const onlineIds = [...onlineRiderSockets.keys()].filter(id => Number(id) !== Number(excludeRiderId));
+    if (!onlineIds.length) return [];
+    const placeholders = onlineIds.map(() => '?').join(',');
+    const [busyRiders] = await pool.execute(
+        `SELECT DISTINCT assigned_rider_id FROM orders WHERE order_type = 'Delivery' AND status = 'Out for Delivery' AND assigned_rider_id IN (${placeholders})`,
+        onlineIds
+    );
+    const busyIds = new Set(busyRiders.map(row => Number(row.assigned_rider_id)));
+    return onlineIds.filter(id => !busyIds.has(Number(id)));
+};
+
+const publishRiderAvailability = async () => {
+    try {
+        const availableRiderIds = await getAvailableOnlineRiderIds();
+        for (const riderId of onlineRiderSockets.keys()) {
+            io.to(`rider_${riderId}`).emit('rider_availability_update', {
+                availableRiderCount: availableRiderIds.filter(availableId => Number(availableId) !== Number(riderId)).length
+            });
+        }
+    } catch (error) {
+        console.error('Could not update online rider availability:', error.message);
+    }
+};
+
+io.use(async (socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next();
+    try {
+        const payload = jwt.verify(token, process.env.JWT_SECRET);
+        const [users] = await pool.execute('SELECT id, firstname, lastname, role FROM users WHERE id = ? LIMIT 1', [payload.id]);
+        if (!users.length) return next(new Error('Socket account not found.'));
+        const account = users[0];
+        socket.data.authUser = {
+            id: account.id,
+            role: account.role,
+            name: `${account.firstname} ${account.lastname}`
+        };
+        return next();
+    } catch (_) {
+        return next(new Error('Socket authentication failed.'));
+    }
+});
+
 // Helper to log activities
 const logActivity = async (userId, action) => {
     try {
@@ -457,6 +518,16 @@ const logActivity = async (userId, action) => {
 };
 
 io.on('connection', (socket) => {
+    const socketUser = socket.data.authUser;
+    if (socketUser?.role === 'rider') {
+        const riderId = Number(socketUser.id);
+        socket.join('online_riders');
+        socket.join(`rider_${riderId}`);
+        const riderSockets = onlineRiderSockets.get(riderId) || new Set();
+        riderSockets.add(socket.id);
+        onlineRiderSockets.set(riderId, riderSockets);
+        publishRiderAvailability();
+    }
     socket.on('join_order', (orderId) => { socket.join(`order_${orderId}`); });
     socket.on('send_message', async (data) => {
         try {
@@ -477,6 +548,15 @@ io.on('connection', (socket) => {
     socket.on('status_change', (data) => {
         io.to(`order_${data.orderId}`).emit('status_updated', data);
         io.emit('dashboard_refresh'); 
+    });
+    socket.on('disconnect', () => {
+        if (socketUser?.role !== 'rider') return;
+        const riderId = Number(socketUser.id);
+        const riderSockets = onlineRiderSockets.get(riderId);
+        if (!riderSockets) return;
+        riderSockets.delete(socket.id);
+        if (riderSockets.size === 0) onlineRiderSockets.delete(riderId);
+        publishRiderAvailability();
     });
 });
 
@@ -503,6 +583,11 @@ const verifyAdminOnly = (req, res, next) => {
 
 const verifyRiderOrAdmin = (req, res, next) => {
     if (req.user && ['rider', 'admin'].includes(req.user.role)) next();
+    else res.status(403).json({ error: 'Rider access required' });
+};
+
+const verifyRiderOnly = (req, res, next) => {
+    if (req.user?.role === 'rider') next();
     else res.status(403).json({ error: 'Rider access required' });
 };
 
@@ -1292,7 +1377,12 @@ app.put('/api/admin/orders/:id/status', authenticateToken, verifyAdminOrStaff, a
             END
             ELSE NULL
         END WHERE id = ?`, [nextStatus, nextStatus, req.params.id]);
+        if (['Completed', 'Cancelled'].includes(nextStatus)) {
+            const [cancelledRequests] = await pool.execute('UPDATE rider_assistance_requests SET status = "Cancelled" WHERE order_id = ? AND status = "Pending"', [req.params.id]);
+            if (cancelledRequests.affectedRows) io.to('online_riders').emit('rider_assistance_refresh');
+        }
         await logActivity(req.user.id, `Updated order ${existingOrder.order_number || `O-${String(req.params.id).padStart(4, '0')}`} status to ${nextStatus}`);
+        await publishRiderAvailability();
 
         if (nextStatus !== existingOrder.status && ['Completed', 'Cancelled'].includes(nextStatus) && ['Delivery', 'Pick-up'].includes(existingOrder.order_type)) {
             sendOnlineOrderStatusEmail({ orderId: existingOrder.id, status: nextStatus })
@@ -1336,6 +1426,7 @@ app.post('/api/rider/orders/:id/claim', authenticateToken, verifyRiderOrAdmin, a
         );
         await connection.commit();
         await logActivity(req.user.id, `Claimed delivery order ${orderId}`);
+        await publishRiderAvailability();
         io.emit('dashboard_refresh');
         return res.json({ message: 'Delivery claimed.' });
     } catch (error) {
@@ -1374,8 +1465,11 @@ app.post('/api/rider/orders/:id/complete', authenticateToken, verifyRiderOrAdmin
             'UPDATE orders SET status = "Completed", delivery_proof_url = ?, chat_expires_at = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE) WHERE id = ?',
             [proofUrl, orderId]
         );
+        await connection.execute('UPDATE rider_assistance_requests SET status = "Cancelled" WHERE order_id = ? AND status = "Pending"', [orderId]);
         await connection.commit();
         await logActivity(req.user.id, `Completed delivery order ${order.order_number || orderId} with proof photo`);
+        io.to('online_riders').emit('rider_assistance_refresh');
+        await publishRiderAvailability();
         io.emit('dashboard_refresh');
         sendOnlineOrderStatusEmail({ orderId, status: 'Completed' }).catch(mailError => console.error('Order status email notification failed:', mailError.message));
         return res.json({ message: 'Delivery marked as delivered with proof.' });
@@ -1383,6 +1477,211 @@ app.post('/api/rider/orders/:id/complete', authenticateToken, verifyRiderOrAdmin
         if (connection) try { await connection.rollback(); } catch (_) {}
         console.error('Failed to complete delivery:', error.message);
         return res.status(500).json({ error: 'Could not complete this delivery.' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.get('/api/rider/assistance', authenticateToken, verifyRiderOnly, async (req, res) => {
+    try {
+        const [incomingRequests] = await pool.execute(`SELECT a.id, a.order_id, a.requester_rider_id, a.message, a.created_at,
+            o.order_number, o.customer_name, o.branch, u.firstname AS requester_firstname, u.lastname AS requester_lastname
+            FROM rider_assistance_requests a
+            JOIN orders o ON o.id = a.order_id
+            JOIN users u ON u.id = a.requester_rider_id
+            WHERE a.status = 'Pending' AND a.requester_rider_id <> ? AND o.status = 'Out for Delivery'
+              AND o.assigned_rider_id = a.requester_rider_id
+            ORDER BY a.created_at DESC LIMIT 30`, [req.user.id]);
+        const [myRequests] = await pool.execute(`SELECT a.id, a.order_id, a.message, a.status, a.created_at,
+            a.accepted_at, a.accepted_by_rider_id, o.order_number, u.firstname AS accepted_firstname, u.lastname AS accepted_lastname
+            FROM rider_assistance_requests a
+            JOIN orders o ON o.id = a.order_id
+            LEFT JOIN users u ON u.id = a.accepted_by_rider_id
+            WHERE a.requester_rider_id = ? AND a.status IN ('Pending', 'Accepted')
+              AND a.created_at > DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 2 DAY)
+            ORDER BY a.created_at DESC LIMIT 10`, [req.user.id]);
+        const availableRiderIds = await getAvailableOnlineRiderIds(req.user.id);
+        return res.json({
+            incomingRequests: incomingRequests.map(request => ({
+                ...request,
+                requester_name: `${request.requester_firstname} ${request.requester_lastname}`
+            })),
+            myRequests,
+            availableRiderCount: availableRiderIds.length
+        });
+    } catch (error) {
+        console.error('Failed to load rider assistance requests:', error.message);
+        return res.status(500).json({ error: 'Could not load rider assistance requests.' });
+    }
+});
+
+app.post('/api/rider/assistance', authenticateToken, verifyRiderOnly, async (req, res) => {
+    const orderId = Number(req.body?.orderId);
+    const message = String(req.body?.message || '').trim();
+    if (!Number.isInteger(orderId) || orderId < 1 || !message || message.length > 1000) {
+        return res.status(400).json({ error: 'Enter a message for assistance.' });
+    }
+    let connection;
+    try {
+        const availableRiderIds = await getAvailableOnlineRiderIds(req.user.id);
+        if (!availableRiderIds.length) {
+            return res.status(409).json({ error: 'No other riders are currently online and available.', availableRiderCount: 0 });
+        }
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [orders] = await connection.execute(
+            'SELECT id, order_number, customer_name, branch, status, order_type, assigned_rider_id FROM orders WHERE id = ? LIMIT 1 FOR UPDATE',
+            [orderId]
+        );
+        const order = orders[0];
+        if (!order || order.order_type !== 'Delivery' || order.status !== 'Out for Delivery' || Number(order.assigned_rider_id) !== Number(req.user.id)) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'You can only request help for your active delivery.' });
+        }
+        const [pending] = await connection.execute(
+            'SELECT id FROM rider_assistance_requests WHERE order_id = ? AND requester_rider_id = ? AND status = "Pending" LIMIT 1 FOR UPDATE',
+            [orderId, req.user.id]
+        );
+        let requestId = pending[0]?.id;
+        if (!requestId) {
+            const [inserted] = await connection.execute(
+                'INSERT INTO rider_assistance_requests (order_id, requester_rider_id, message) VALUES (?, ?, ?)',
+                [orderId, req.user.id, message]
+            );
+            requestId = inserted.insertId;
+        } else {
+            await connection.execute('UPDATE rider_assistance_requests SET message = ? WHERE id = ?', [message, requestId]);
+        }
+        const [requesterRows] = await connection.execute('SELECT firstname, lastname FROM users WHERE id = ? LIMIT 1', [req.user.id]);
+        const requesterName = `${requesterRows[0]?.firstname || ''} ${requesterRows[0]?.lastname || ''}`.trim();
+        const assistanceRequest = {
+            id: requestId,
+            order_id: orderId,
+            order_number: order.order_number,
+            customer_name: order.customer_name,
+            branch: order.branch,
+            requester_rider_id: req.user.id,
+            requester_name: requesterName,
+            message,
+            status: 'Pending'
+        };
+        await connection.commit();
+        await logActivity(req.user.id, `Requested assistance for delivery ${order.order_number || orderId}`);
+        for (const riderId of availableRiderIds) io.to(`rider_${riderId}`).emit('rider_assistance_request', assistanceRequest);
+        return res.status(pending.length ? 200 : 201).json({
+            message: 'Your assistance request was sent to online available riders.',
+            request: assistanceRequest,
+            availableRiderCount: availableRiderIds.length
+        });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Could not create rider assistance request:', error.message);
+        return res.status(500).json({ error: 'Could not send your assistance request.' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.delete('/api/rider/assistance/:id', authenticateToken, verifyRiderOnly, async (req, res) => {
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [requests] = await connection.execute(
+            'SELECT id, order_id FROM rider_assistance_requests WHERE id = ? AND requester_rider_id = ? AND status = "Pending" LIMIT 1 FOR UPDATE',
+            [req.params.id, req.user.id]
+        );
+        if (!requests.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: 'Pending assistance request not found.' });
+        }
+        await connection.execute('UPDATE rider_assistance_requests SET status = "Cancelled" WHERE id = ?', [requests[0].id]);
+        await connection.commit();
+        io.to('online_riders').emit('rider_assistance_resolved', { requestId: requests[0].id, status: 'Cancelled' });
+        return res.json({ message: 'Assistance request cancelled.' });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Could not cancel rider assistance request:', error.message);
+        return res.status(500).json({ error: 'Could not cancel the assistance request.' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.post('/api/rider/assistance/:id/accept', authenticateToken, verifyRiderOnly, async (req, res) => {
+    const requestId = Number(req.params.id);
+    if (!Number.isInteger(requestId) || requestId < 1) return res.status(400).json({ error: 'Invalid assistance request.' });
+    let connection;
+    try {
+        if (!onlineRiderSockets.has(Number(req.user.id))) {
+            return res.status(409).json({ error: 'You must be online to accept an assistance request.' });
+        }
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const [riders] = await connection.execute('SELECT id FROM users WHERE id = ? AND role = "rider" FOR UPDATE', [req.user.id]);
+        if (!riders.length) {
+            await connection.rollback();
+            return res.status(403).json({ error: 'Rider access required.' });
+        }
+        const [activeDeliveries] = await connection.execute(
+            'SELECT id FROM orders WHERE assigned_rider_id = ? AND order_type = "Delivery" AND status = "Out for Delivery" LIMIT 1 FOR UPDATE',
+            [req.user.id]
+        );
+        if (activeDeliveries.length) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'Finish your current delivery before accepting an assistance request.' });
+        }
+        const [requestRows] = await connection.execute('SELECT * FROM rider_assistance_requests WHERE id = ? LIMIT 1', [requestId]);
+        const initialRequest = requestRows[0];
+        if (!initialRequest || Number(initialRequest.requester_rider_id) === Number(req.user.id)) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'This assistance request is no longer available.' });
+        }
+        const [orders] = await connection.execute(
+            'SELECT id, order_number, status, order_type, assigned_rider_id FROM orders WHERE id = ? LIMIT 1 FOR UPDATE',
+            [initialRequest.order_id]
+        );
+        const order = orders[0];
+        const [lockedRequests] = await connection.execute('SELECT * FROM rider_assistance_requests WHERE id = ? LIMIT 1 FOR UPDATE', [requestId]);
+        const assistanceRequest = lockedRequests[0];
+        if (!assistanceRequest || assistanceRequest.status !== 'Pending') {
+            await connection.rollback();
+            return res.status(409).json({ error: 'This assistance request has already been taken.' });
+        }
+        if (!order || order.status !== 'Out for Delivery' || order.order_type !== 'Delivery' || Number(order.assigned_rider_id) !== Number(assistanceRequest.requester_rider_id)) {
+            await connection.execute('UPDATE rider_assistance_requests SET status = "Cancelled" WHERE id = ?', [requestId]);
+            await connection.commit();
+            io.to('online_riders').emit('rider_assistance_resolved', { requestId, status: 'Cancelled' });
+            return res.status(409).json({ error: 'This delivery is no longer available for assistance.' });
+        }
+        const [helperRows] = await connection.execute('SELECT firstname, lastname FROM users WHERE id = ? LIMIT 1', [req.user.id]);
+        const helperName = `${helperRows[0]?.firstname || ''} ${helperRows[0]?.lastname || ''}`.trim();
+        await connection.execute('UPDATE orders SET assigned_rider_id = ? WHERE id = ?', [req.user.id, order.id]);
+        await connection.execute(
+            'UPDATE rider_assistance_requests SET status = "Accepted", accepted_by_rider_id = ?, accepted_at = CURRENT_TIMESTAMP WHERE id = ?',
+            [req.user.id, requestId]
+        );
+        await connection.execute(
+            'UPDATE rider_assistance_requests SET status = "Cancelled" WHERE order_id = ? AND status = "Pending" AND id <> ?',
+            [order.id, requestId]
+        );
+        await connection.commit();
+        await logActivity(req.user.id, `Accepted assistance request for delivery ${order.order_number || order.id}`);
+        io.to(`rider_${assistanceRequest.requester_rider_id}`).emit('rider_assistance_accepted', {
+            requestId,
+            orderId: order.id,
+            orderNumber: order.order_number,
+            riderId: req.user.id,
+            riderName: helperName
+        });
+        io.to('online_riders').emit('rider_assistance_resolved', { requestId, status: 'Accepted' });
+        io.emit('dashboard_refresh');
+        await publishRiderAvailability();
+        return res.json({ message: 'Assistance accepted. The delivery is now assigned to you.', orderId: order.id });
+    } catch (error) {
+        if (connection) try { await connection.rollback(); } catch (_) {}
+        console.error('Could not accept rider assistance request:', error.message);
+        return res.status(500).json({ error: 'Could not accept this assistance request.' });
     } finally {
         if (connection) connection.release();
     }
